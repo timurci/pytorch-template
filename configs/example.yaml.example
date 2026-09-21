@@ -1,0 +1,81 @@
+# Shared experiment config template.
+# `template-train` and `template-infer` both validate this file; each uses its
+# own sections. See docs/cli.md for the full field reference.
+# Paths are relative to the working directory.
+
+data:
+  train_path: data/train.csv
+  test_path: data/test.csv
+  id_column: id
+  target:
+    column: label
+    mapping:
+      negative: 0
+      positive: 1
+
+pipeline:
+  # Applied in order before the dataset is built. Available kinds:
+  #   drop_columns {columns} | map_values {column, mapping} |
+  #   scale_by_cap {column, cap, floor} |
+  #   log_scale_by_cap {column, cap} | one_hot {column, levels}
+  steps:
+    - kind: drop_columns
+      columns: [id]
+    - kind: one_hot
+      column: city
+      levels: [a, b, c]
+    - kind: scale_by_cap
+      column: age
+      cap: 100
+    - kind: log_scale_by_cap
+      column: income
+      cap: 1000000
+
+model:
+  hidden_size: 128
+  hidden_depth: 2 # Linear -> ReLU -> LayerNorm -> Dropout blocks
+  n_classes: 2 # input_size is inferred from the processed frame
+  dropout: 0.0 # p per hidden block; 0 disables
+
+optimizer:
+  kind: adamw # adam | adamw | sgd
+  lr: 0.001
+  weight_decay: 0.0001
+  # momentum: 0.0 # sgd only
+
+loss:
+  kind: cross_entropy # model returns logits
+  # class_weights: balanced # or null (default); inverse-frequency weights
+  #   from the train split, only for cross_entropy
+
+training:
+  epochs: 10
+  batch_size: 4096
+  val_fraction: 0.1
+  seed: 42
+  shuffle: true
+  device: auto # auto | cpu | cuda | mps
+  # stdout: one params line + periodic metrics (every_n_steps, final epoch
+  #   always); null: silent; mlflow: logs to a run the CLI opens. MLflow
+  #   fields: experiment_name (default template), run_name, tracking_uri.
+  trackers:
+    - kind: stdout
+      # every_n_steps: 10
+    # - kind: mlflow
+    #   experiment_name: template
+    #   run_name: baseline
+    #   tracking_uri: http://localhost:5000
+  # Optional train-time batch augmentation, applied per training batch on the
+  # training device. Available kinds:
+  #   identity {} | gaussian_noise {std}
+  # augmenter:
+  #   kind: gaussian_noise
+  #   std: 0.01
+  # track_gradients: false # log train/grad_norm (mean per-batch total L2 norm)
+  checkpoint_path: outputs/model.pt
+
+inference:
+  batch_size: 8192
+  save: true # write output_path as id,label
+  report: true # print rows + probability summary
+  output_path: outputs/predictions.csv

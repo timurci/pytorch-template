@@ -1,0 +1,14 @@
+.venv/
+data/
+outputs/
+mlruns/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.yaml
+*.db
+.pytest_cache/
+.ruff_cache/
