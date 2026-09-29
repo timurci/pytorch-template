@@ -1,5 +1,5 @@
 .venv/
-data/
+/data/
 outputs/
 mlruns/
 __pycache__/

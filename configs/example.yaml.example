@@ -6,35 +6,58 @@
 data:
   train_path: data/train.csv
   test_path: data/test.csv
-  id_column: id
+  id_column: id # always metadata: kept untouched, reassembled into predictions
   target:
     column: label
-    mapping:
+    mapping: # class indices; must cover exactly 0..model.n_classes-1
       negative: 0
       positive: 1
-
-pipeline:
-  # Applied in order before the dataset is built. Available kinds:
-  #   drop_columns {columns} | map_values {column, mapping} |
-  #   scale_by_cap {column, cap, floor} |
-  #   log_scale_by_cap {column, cap} | one_hot {column, levels}
-  steps:
-    - kind: drop_columns
-      columns: [id]
+  # metadata: [] # extra columns kept untouched as sample identity (id_column
+  #   is always included); metadata, target, and exclude must not overlap
+  # exclude: [] # dropped columns; features are everything that remains
+  encodings:
+    # Categorical feature columns need declared levels (inline, or one level
+    # per line in a vocab file via levels_path); unlisted feature columns
+    # pass through numerically. Available kinds:
+    #   one_hot {column, levels | levels_path}
     - kind: one_hot
       column: city
       levels: [a, b, c]
+
+processing:
+  # One ordered list of tensor-only steps, applied per batch after the move
+  # to the training device: preprocessing and augmentation interleave freely
+  # (stacking is list order). Column names resolve to feature blocks at
+  # composition; a step on a non-feature column fails at build.
+  # `stages` picks where a step runs: train | eval | predict.
+  #   scale_by_cap / log_scale_by_cap default to all stages (predict-time
+  #   scaling is part of the feature definition);
+  #   gaussian_noise defaults to [train].
+  # Available kinds:
+  #   scale_by_cap {column, cap, floor} |
+  #   log_scale_by_cap {column, cap} | gaussian_noise {std}
+  steps:
     - kind: scale_by_cap
       column: age
       cap: 100
-    - kind: log_scale_by_cap
-      column: income
-      cap: 1000000
+      floor: 0.0
+    # - kind: log_scale_by_cap
+    #   column: income
+    #   cap: 1000000
+    - kind: gaussian_noise
+      std: 0.01
+      stages: [train]
+    # Seeded validation-time augmentation: runs on val batches at stage
+    # "eval" with per-(seed, stage, epoch, batch) generators, so a seeded
+    # run reproduces exactly.
+    # - kind: gaussian_noise
+    #   std: 0.005
+    #   stages: [eval]
 
 model:
   hidden_size: 128
   hidden_depth: 2 # Linear -> ReLU -> LayerNorm -> Dropout blocks
-  n_classes: 2 # input_size is inferred from the processed frame
+  n_classes: 2 # input size is the schema's feature width (known before any row is read)
   dropout: 0.0 # p per hidden block; 0 disables
 
 optimizer:
@@ -52,7 +75,7 @@ training:
   epochs: 10
   batch_size: 4096
   val_fraction: 0.1
-  seed: 42
+  seed: 42 # partition, shuffle, and processing RNG streams
   shuffle: true
   device: auto # auto | cpu | cuda | mps
   # stdout: one params line + periodic metrics (every_n_steps, final epoch
@@ -65,17 +88,11 @@ training:
     #   experiment_name: template
     #   run_name: baseline
     #   tracking_uri: http://localhost:5000
-  # Optional train-time batch augmentation, applied per training batch on the
-  # training device. Available kinds:
-  #   identity {} | gaussian_noise {std}
-  # augmenter:
-  #   kind: gaussian_noise
-  #   std: 0.01
   # track_gradients: false # log train/grad_norm (mean per-batch total L2 norm)
   checkpoint_path: outputs/model.pt
 
 inference:
   batch_size: 8192
-  save: true # write output_path as id,label
+  save: true # write output_path as id,label (class-1 probabilities)
   report: true # print rows + probability summary
   output_path: outputs/predictions.csv

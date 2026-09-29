@@ -1,9 +1,35 @@
-from typing import Protocol
+"""The feature processing step contract: `Batch` in, `Batch` out.
 
-import polars as pl
+Feature processing is the one place data changes during a run, and it is
+tensor-only: a step receives a batch of tensors and returns a batch of
+tensors. Raw forms, column names, and encodings never appear here — names
+resolve to feature-tensor blocks (`TableSchema.feature_slice`) at
+composition time, so one step works regardless of how the data was
+ingested.
+
+Step invariants:
+
+- Steps never mutate their input; they return a `Batch` (cloning on
+  write). Fields a step does not touch pass through unchanged.
+- Deterministic steps ignore `rng`; stochastic steps MUST draw from `rng`
+  (never the global RNG) so a seeded run reproduces exactly. This makes
+  validation-time augmentation a tagging choice, not a code change: tag a
+  stochastic step for the `eval` stage and it runs there, reproducibly.
+- Steps that change the row count keep `source_indices` and `targets`
+  aligned with `features` (label-preserving steps satisfy
+  `targets == input_targets[source_indices]`).
+"""
+
+from typing import Literal, Protocol
+
+from torch import Generator
+
+from template.data import Batch
+
+Stage = Literal["train", "eval", "predict"]
 
 
-class Transform(Protocol):
-    def apply(self, frame: pl.DataFrame) -> pl.DataFrame: ...
+class ProcessingStep(Protocol):
+    """One processing step over batched tensors."""
 
-    def revert(self, frame: pl.DataFrame) -> pl.DataFrame: ...
+    def process(self, batch: Batch, rng: Generator) -> Batch: ...

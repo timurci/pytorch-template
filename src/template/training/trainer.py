@@ -7,7 +7,7 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
 from template.data import Batch
-from template.features import Augmenter
+from template.features import ProcessingPipeline, Stage
 from template.tracking.protocol import ExperimentTracker
 
 
@@ -33,10 +33,13 @@ class Trainer:
     support log `0.0` so trackers never see NaN; macros are unweighted means
     over all classes.
 
-    An optional `Augmenter` is applied to each training batch after it is
-    moved to `device` and before the forward pass; the augmented features and
-    labels replace the batch (train metrics therefore describe the augmented
-    data). Validation batches are never augmented.
+    An optional `ProcessingPipeline` runs on each batch after the move to
+    `device`: training batches at stage `train`, validation batches at stage
+    `eval` (so seeded validation-time augmentation is a tagging choice in
+    the pipeline, not trainer code). Processed features and labels replace
+    the batch — metrics therefore describe the processed data. Each batch
+    gets its own RNG stream seeded from `(seed, stage, epoch, batch)`, so a
+    seeded run reproduces exactly.
     """
 
     def __init__(
@@ -58,19 +61,28 @@ class Trainer:
         epochs: int,
         loss_fn: Callable[[Tensor, Tensor], Tensor],
         trackers: Sequence[ExperimentTracker] = (),
-        augmenter: Augmenter | None = None,
+        processing: ProcessingPipeline | None = None,
+        seed: int = 0,
         track_gradients: bool = False,
     ) -> None:
         for epoch in range(epochs):
             train_metrics = self._run_train_epoch(
                 train_loader,
                 loss_fn,
-                augmenter=augmenter,
+                processing=processing,
+                seed=seed,
+                epoch=epoch,
                 track_gradients=track_gradients,
             )
             self._log_metrics(train_metrics, trackers, step=epoch)
             if val_loader is not None:
-                val_metrics = self._run_val_epoch(val_loader, loss_fn)
+                val_metrics = self._run_val_epoch(
+                    val_loader,
+                    loss_fn,
+                    processing=processing,
+                    seed=seed,
+                    epoch=epoch,
+                )
                 self._log_metrics(val_metrics, trackers, step=epoch)
 
     def _run_train_epoch(
@@ -78,7 +90,9 @@ class Trainer:
         loader: DataLoader[Batch],
         loss_fn: Callable[[Tensor, Tensor], Tensor],
         *,
-        augmenter: Augmenter | None = None,
+        processing: ProcessingPipeline | None = None,
+        seed: int = 0,
+        epoch: int = 0,
         track_gradients: bool = False,
     ) -> dict[str, float]:
         self._model.train()
@@ -88,7 +102,10 @@ class Trainer:
             loss_fn,
             self._device,
             optimizer=self._optimizer,
-            augmenter=augmenter,
+            processing=processing,
+            stage="train",
+            seed=seed,
+            epoch=epoch,
             track_gradients=track_gradients,
         )
         logged = _metric_entries("train", metrics)
@@ -100,10 +117,23 @@ class Trainer:
         self,
         loader: DataLoader[Batch],
         loss_fn: Callable[[Tensor, Tensor], Tensor],
+        *,
+        processing: ProcessingPipeline | None = None,
+        seed: int = 0,
+        epoch: int = 0,
     ) -> dict[str, float]:
         self._model.eval()
         with torch.no_grad():
-            metrics = _run_epoch(self._model, loader, loss_fn, self._device)
+            metrics = _run_epoch(
+                self._model,
+                loader,
+                loss_fn,
+                self._device,
+                processing=processing,
+                stage="eval",
+                seed=seed,
+                epoch=epoch,
+            )
         return _metric_entries("val", metrics)
 
     def _log_metrics(
@@ -145,7 +175,11 @@ def _run_epoch(
     loss_fn: Callable[[Tensor, Tensor], Tensor],
     device: torch.device,
     optimizer: Optimizer | None = None,
-    augmenter: Augmenter | None = None,
+    *,
+    processing: ProcessingPipeline | None = None,
+    stage: Stage = "train",
+    seed: int = 0,
+    epoch: int = 0,
     track_gradients: bool = False,
 ) -> _EpochMetrics:
     total = 0.0
@@ -156,13 +190,21 @@ def _run_epoch(
     true_positive: list[Tensor] = []
     false_positive: list[Tensor] = []
     false_negative: list[Tensor] = []
-    for batch in loader:
-        features = batch["features"].to(device)
-        targets = batch["targets"].to(device)
-        if augmenter is not None:
-            augmented = augmenter.augment(features, targets)
-            features = augmented.features
-            targets = augmented.targets
+    for index, batch in enumerate(loader):
+        moved: Batch = {
+            "features": batch["features"].to(device),
+            "targets": batch["targets"].to(device),
+        }
+        if "source_indices" in batch:
+            moved["source_indices"] = batch["source_indices"].to(device)
+        if processing is not None:
+            moved = processing.process(
+                moved,
+                stage=stage,
+                rng=_batch_rng(seed, stage, epoch, index),
+            )
+        features = moved["features"]
+        targets = moved["targets"]
         if optimizer is not None:
             optimizer.zero_grad()
         logits = model(features)
@@ -213,6 +255,21 @@ def _run_epoch(
         classes=classes,
         grad_norm=grad_norm,
     )
+
+
+_STAGE_OFFSET: dict[Stage, int] = {"train": 0, "eval": 1, "predict": 2}
+
+
+def _batch_rng(seed: int, stage: Stage, epoch: int, index: int) -> torch.Generator:
+    """Per-(seed, stage, epoch, batch) CPU generator.
+
+    CPU-side so one seed reproduces the same draws on every device; steps
+    move drawn tensors to the batch's device.
+    """
+    value = (
+        seed * 1_000_003 + epoch * 10_007 + index * 101 + _STAGE_OFFSET[stage]
+    ) % (2**63)
+    return torch.Generator().manual_seed(value)
 
 
 def _class_metrics(

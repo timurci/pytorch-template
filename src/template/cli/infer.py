@@ -10,10 +10,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from template.cli.config import load_config
-from template.cli.runtime import configure_logging, feature_count
-from template.data import TableDataset
+from template.cli.runtime import configure_logging
+from template.data import TableDataset, ValidatedSource
 from template.models import MLPClassifier
-from template.persistence import load_checkpoint, load_table, save_table
+from template.persistence import CsvSource, load_checkpoint, save_table
 
 logger = logging.getLogger(__name__)
 
@@ -23,13 +23,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     config = load_config(args.config)
 
-    frame = load_table(config.data.test_path)
-    ids = frame.get_column(config.data.id_column)
-    features = config.pipeline.build().apply(frame)
-    dataset = TableDataset.from_frame(features)
+    raw = CsvSource(config.data.test_path)
+    schema = config.data.build_schema(raw.columns, include_target=False)
+    source = ValidatedSource(raw, schema)
+    # Ids are metadata: they ride through ingestion untouched (row order is
+    # preserved), so processing is free to reshape the feature blocks.
+    ids = source.read(range(source.count())).frame.get_column(
+        config.data.id_column
+    )
+    processing = config.processing.build(schema)
 
+    dataset = TableDataset(source)
     model = MLPClassifier(
-        feature_count(dataset),
+        schema.feature_width,
         config.model.hidden_size,
         config.model.hidden_depth,
         config.model.n_classes,
@@ -41,10 +47,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     loader = DataLoader(
         dataset, batch_size=config.inference.batch_size, shuffle=False
     )
+    rng = torch.Generator().manual_seed(config.training.seed)
     batches: list[torch.Tensor] = []
     with torch.no_grad():
         for batch in loader:
-            logits = model(batch["features"])
+            processed = processing.process(batch, stage="predict", rng=rng)
+            logits = model(processed["features"])
             batches.append(torch.softmax(logits, dim=1)[:, 1])
     probabilities = torch.cat(batches) if batches else torch.empty(0)
 
@@ -74,7 +82,7 @@ def _report(rows: int, probabilities: torch.Tensor) -> None:
     )
 
 
-def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="template-infer",
         description="Run inference from a YAML config and trained checkpoint.",

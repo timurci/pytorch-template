@@ -10,12 +10,12 @@ The architecture is documented in [docs/architecture.md](docs/architecture.md)
 
 | Layer | Role |
 | --- | --- |
-| `persistence` | Table and checkpoint I/O; caller supplies paths |
-| `data` | The `Batch` contract + in-memory tensor datasets; no file I/O |
-| `features` | Reversible preprocessing `Transform`s (`Pipeline`) + train-time `Augmenter` protocol |
+| `persistence` | Raw table readers (`CsvSource` / `ParquetSource`) + table/checkpoint I/O; caller supplies paths |
+| `data` | Ingestion: `RawTableSource` / `DataSource` ports, `TableSchema` (column roles + encodings), `ValidatedTable` / `ValidatedSource`, the `Batch` contract, and the torch-side `TableDataset` adapter; no file I/O |
+| `features` | Feature processing: `ProcessingStep` / `ProcessingPipeline` — tensor-only preprocessing and augmentation in one stage-tagged, seeded machinery |
 | `models` | `nn.Module` architectures (reference: `MLPClassifier`) |
 | `tracking` | `ExperimentTracker` protocol; `null` / `stdout` / `mlflow` adapters |
-| `training` | `Trainer`: the epoch loop; trackers and augmenter injected |
+| `training` | `Trainer`: the epoch loop; applies the processing pipeline per batch; trackers injected |
 | `cli` | Entrypoints (`template-train` / `template-infer`); Pydantic config as composition root |
 
 ## Quickstart
@@ -36,8 +36,9 @@ field reference: [docs/cli.md](docs/cli.md).
 1. Rename `src/template` (package), `name` / `[project.scripts]`
    (pyproject), and the `"template"` logger in `cli/runtime.py` — all
    greppable as `template`.
-2. Adapt the marked layers to your task: `data.Batch` + dataset, your
-   models, your transforms/augmenters, your trainer specialization.
+2. Adapt the marked layers to your task: `data.Batch` + the dataset adapter
+   (+ the source ports if your raw form is not a table), your models, your
+   processing steps, your trainer specialization.
 3. Wire new implementations into the `kind` unions in `cli/config.py`.
 
 Step-by-step: [docs/architecture.md#instantiating-the-template](docs/architecture.md#instantiating-the-template).
