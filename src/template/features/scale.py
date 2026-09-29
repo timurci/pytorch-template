@@ -1,53 +1,48 @@
+"""Deterministic per-block scaling steps."""
+
 import math
 
-import polars as pl
+from torch import Generator
 
-from template.features._columns import require_columns
-from template.features.protocol import Transform
+from template.data import Batch
 
 
-class ScaleByCap(Transform):
-    def __init__(
-        self,
-        column: str,
-        cap: float,
-        floor: float = 0.0,
-    ) -> None:
+class ScaleByCap:
+    """Scales one feature block to `(x - floor) / (cap - floor)`.
+
+    The block is a `TableSchema.feature_slice` resolved at composition, so
+    the step is tensor-only and sees no column names.
+    """
+
+    def __init__(self, block: slice, cap: float, floor: float = 0.0) -> None:
         if cap <= floor:
             raise ValueError("cap must be greater than floor")
-        self._column = column
+        self._block = block
         self._cap = cap
         self._floor = floor
 
-    def apply(self, frame: pl.DataFrame) -> pl.DataFrame:
-        require_columns(frame, [self._column])
-        scaled = (pl.col(self._column) - self._floor) / (self._cap - self._floor)
-        return frame.with_columns(scaled.alias(self._column))
-
-    def revert(self, frame: pl.DataFrame) -> pl.DataFrame:
-        require_columns(frame, [self._column])
-        restored = (
-            pl.col(self._column) * (self._cap - self._floor) + self._floor
+    def process(self, batch: Batch, rng: Generator) -> Batch:
+        features = batch["features"].clone()
+        block = features[:, self._block]
+        features[:, self._block] = (block - self._floor) / (
+            self._cap - self._floor
         )
-        return frame.with_columns(restored.alias(self._column))
+        return {**batch, "features": features}
 
 
-class LogScaleByCap(Transform):
-    def __init__(self, column: str, cap: float) -> None:
+class LogScaleByCap:
+    """Scales one feature block by `log(clamp(x, min=1)) / log(cap)`."""
+
+    def __init__(self, block: slice, cap: float) -> None:
         if cap <= 1:
             raise ValueError("cap must be greater than 1")
-        self._column = column
+        self._block = block
         self._cap = cap
 
-    def apply(self, frame: pl.DataFrame) -> pl.DataFrame:
-        require_columns(frame, [self._column])
-        scaled = (
-            pl.col(self._column).clip(lower_bound=1.0).log()
-            / math.log(self._cap)
+    def process(self, batch: Batch, rng: Generator) -> Batch:
+        features = batch["features"].clone()
+        block = features[:, self._block]
+        features[:, self._block] = block.clamp(min=1.0).log() / math.log(
+            self._cap
         )
-        return frame.with_columns(scaled.alias(self._column))
-
-    def revert(self, frame: pl.DataFrame) -> pl.DataFrame:
-        require_columns(frame, [self._column])
-        restored = (pl.col(self._column) * math.log(self._cap)).exp()
-        return frame.with_columns(restored.alias(self._column))
+        return {**batch, "features": features}

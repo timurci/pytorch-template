@@ -8,7 +8,7 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 
 from template.data import Batch
-from template.features import GaussianNoiseAugmenter, IdentityAugmenter
+from template.features import GaussianNoise, ProcessingPipeline
 from template.models import MLPClassifier
 from template.training import Trainer
 
@@ -41,6 +41,17 @@ class _RecordingTracker:
         self.metrics.append(dict(metrics))
 
 
+class _CountingStep:
+    """Test double: counts how many batches it processed."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def process(self, batch: Batch, rng: torch.Generator) -> Batch:
+        self.calls += 1
+        return batch
+
+
 def _loader(rows: int = 64, features: int = 8) -> DataLoader[Batch]:
     generator = torch.Generator().manual_seed(0)
     dataset = _DictDataset(
@@ -56,22 +67,24 @@ def _trainer() -> Trainer:
     return Trainer(model, optimizer, device="cpu")
 
 
-def test_train_epoch_with_augmenter_produces_finite_metrics() -> None:
+def test_train_epoch_with_processing_produces_finite_metrics() -> None:
     tracker = _RecordingTracker()
+    pipeline = ProcessingPipeline([(GaussianNoise(std=0.01), {"train"})])
     _trainer().train(
         _loader(),
         _loader(),
         epochs=2,
         loss_fn=nn.CrossEntropyLoss(),
         trackers=[tracker],
-        augmenter=GaussianNoiseAugmenter(std=0.01),
+        processing=pipeline,
+        seed=42,
     )
     assert len(tracker.metrics) == 4  # train + val per epoch
     for metrics in tracker.metrics:
         assert all(math.isfinite(value) for value in metrics.values())
 
 
-def test_train_epoch_without_augmenter() -> None:
+def test_train_epoch_without_processing() -> None:
     tracker = _RecordingTracker()
     _trainer().train(
         _loader(),
@@ -82,21 +95,19 @@ def test_train_epoch_without_augmenter() -> None:
     assert len(tracker.metrics) == 1  # train only, no val loader
 
 
-def test_identity_augmenter_satisfies_label_invariant() -> None:
-    features = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    augmented = IdentityAugmenter().augment(features, targets)
-    assert torch.equal(augmented.features, features)
-    assert torch.equal(augmented.targets, targets)
-    assert torch.equal(
-        augmented.targets, targets[augmented.source_indices]
+def test_validation_runs_eval_tagged_steps() -> None:
+    train_step = _CountingStep()
+    eval_step = _CountingStep()
+    pipeline = ProcessingPipeline(
+        [(train_step, {"train"}), (eval_step, {"eval"})]
     )
-
-
-def test_gaussian_noise_augmenter_preserves_shape_and_labels() -> None:
-    features = torch.randn(8, 4)
-    targets = torch.randint(0, 2, (8,))
-    augmented = GaussianNoiseAugmenter(std=0.1).augment(features, targets)
-    assert augmented.features.shape == features.shape
-    assert not torch.equal(augmented.features, features)
-    assert torch.equal(augmented.targets, targets[augmented.source_indices])
+    _trainer().train(
+        _loader(),
+        _loader(),
+        epochs=1,
+        loss_fn=nn.CrossEntropyLoss(),
+        processing=pipeline,
+    )
+    # 64 rows / batch 16: four train batches and four validation batches.
+    assert train_step.calls == 4
+    assert eval_step.calls == 4

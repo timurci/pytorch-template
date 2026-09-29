@@ -16,7 +16,6 @@ from template.cli.config import (
     StdoutTrackerConfig,
     TrackerConfig,
 )
-from template.data import TableDataset
 from template.tracking.protocol import ExperimentTracker
 
 
@@ -72,10 +71,6 @@ def _build_tracker(
 
 def flatten_params(config: ExperimentConfig) -> dict[str, object]:
     return _flatten(config.model_dump(mode="json"))
-
-
-def feature_count(dataset: TableDataset) -> int:
-    return int(dataset[0]["features"].shape[0])
 
 
 def _flatten(

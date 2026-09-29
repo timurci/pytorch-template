@@ -6,10 +6,6 @@ import polars as pl
 import torch
 
 
-def load_table(path: Path | str) -> pl.DataFrame:
-    return pl.read_csv(path)
-
-
 def save_table(frame: pl.DataFrame, path: Path | str) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)

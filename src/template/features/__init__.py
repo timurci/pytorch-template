@@ -1,39 +1,24 @@
-"""Reversible preprocessing transforms and train-time augmentation.
+"""The feature processing layer: tensor-side processing of batches.
 
-Two distinct concepts live here:
-
-- `Transform` / `Pipeline`: offline, deterministic, reversible Polars frame
-  preprocessing, applied once before the dataset is built.
-- `Augmenter`: train-time, batch-level tensor augmentation applied by the
-  trainer on the training device; may change the row count and returns
-  provenance indices alongside the augmented batch.
-
-No file I/O, no task-specific column names.
+One contract, one composition: `ProcessingStep` (`Batch` -> `Batch`, tensor
+only) and `ProcessingPipeline` (ordered, stage-tagged steps applied per
+batch). What used to be split into offline preprocessing over dataframes
+and train-time augmentation over tensors is one machinery here: the two
+differ only in stage tags and whether a step draws from the `rng`. Raw
+forms are handled at ingestion (`template.data` / `template.persistence`);
+this layer never sees them.
 """
 
-from template.features.augment import (
-    AugmentedBatch,
-    Augmenter,
-    GaussianNoiseAugmenter,
-    IdentityAugmenter,
-)
-from template.features.drop import DropColumns
-from template.features.map_values import MapValues
-from template.features.onehot import OneHot
-from template.features.pipeline import Pipeline
-from template.features.protocol import Transform
+from template.features.noise import GaussianNoise
+from template.features.pipeline import ProcessingPipeline
+from template.features.protocol import ProcessingStep, Stage
 from template.features.scale import LogScaleByCap, ScaleByCap
 
 __all__ = [
-    "AugmentedBatch",
-    "Augmenter",
-    "DropColumns",
-    "GaussianNoiseAugmenter",
-    "IdentityAugmenter",
+    "GaussianNoise",
     "LogScaleByCap",
-    "MapValues",
-    "OneHot",
-    "Pipeline",
+    "ProcessingPipeline",
+    "ProcessingStep",
     "ScaleByCap",
-    "Transform",
+    "Stage",
 ]

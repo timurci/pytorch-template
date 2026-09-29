@@ -1,17 +1,19 @@
 """Pydantic schemas for the YAML experiment config shared by both CLIs.
 
-A single config file describes the whole experiment: data paths, feature
-pipeline, model architecture, optimizer/loss, training loop, and inference
-output. `template-train` and `template-infer` validate the same file and each
-use their own sections.
+A single config file describes the whole experiment: data paths and column
+roles, feature processing, model architecture, optimizer/loss, training
+loop, and inference output. `template-train` and `template-infer` validate
+the same file and each use their own sections.
 
 This module is the composition root of the template: it is the only place
-that knows both the config file format and the library constructors. Library
-layers never see config objects; every schema builds plain library objects
-via `build()`.
+that knows both the config file format and the library constructors.
+Library layers never see config objects; every schema builds plain library
+objects via `build()`. Column names are config-level declarations; they
+resolve to feature-tensor blocks (`TableSchema.feature_slice`) when the
+processing pipeline is built, so processing steps stay tensor-only.
 """
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Literal, Self
 
@@ -22,17 +24,14 @@ from torch import Tensor, nn
 from torch.nn import Parameter
 from torch.optim import SGD, Adam, AdamW, Optimizer
 
+from template.data import MapValues, OneHot, TableSchema
 from template.features import (
-    Augmenter,
-    DropColumns,
-    GaussianNoiseAugmenter,
-    IdentityAugmenter,
+    GaussianNoise,
     LogScaleByCap,
-    MapValues,
-    OneHot,
-    Pipeline,
+    ProcessingPipeline,
+    ProcessingStep,
     ScaleByCap,
-    Transform,
+    Stage,
 )
 from template.tracking import MLflowTracker, NullTracker, StdoutTracker
 from template.tracking.protocol import ExperimentTracker
@@ -42,12 +41,76 @@ class _Config(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class DropColumnsConfig(_Config):
-    kind: Literal["drop_columns"] = "drop_columns"
-    columns: list[str]
+class OneHotEncodingConfig(_Config):
+    kind: Literal["one_hot"] = "one_hot"
+    column: str
+    levels: list[str] | None = None
+    levels_path: Path | None = None
 
-    def build(self) -> Transform:
-        return DropColumns(self.columns)
+    def build(self) -> OneHot:
+        return OneHot(self.levels, levels_path=self.levels_path)
+
+
+FeatureEncodingConfig = Annotated[
+    OneHotEncodingConfig,
+    Field(discriminator="kind"),
+]
+
+
+class TargetConfig(_Config):
+    column: str
+    mapping: dict[str, int]
+
+    @model_validator(mode="after")
+    def _validate_mapping(self) -> Self:
+        if not self.mapping:
+            raise ValueError("target mapping must not be empty")
+        if len(set(self.mapping.values())) != len(self.mapping):
+            raise ValueError("target mapping must be injective")
+        return self
+
+    def build(self) -> MapValues:
+        return MapValues(self.mapping)
+
+
+class DataConfig(_Config):
+    train_path: Path
+    test_path: Path
+    id_column: str = "id"
+    target: TargetConfig
+    metadata: list[str] = []
+    exclude: list[str] = []
+    encodings: list[FeatureEncodingConfig] = []
+
+    def build_schema(
+        self, columns: Sequence[str], *, include_target: bool = True
+    ) -> TableSchema:
+        """Column names + declared roles/encodings -> `TableSchema`.
+
+        Features are what remains after metadata, target, and exclusions —
+        declaring exclusions is enough. `include_target=False` (inference)
+        drops the target column: absent from unlabeled data, excluded when
+        present.
+        """
+        metadata = list(dict.fromkeys([*self.metadata, self.id_column]))
+        exclude = list(self.exclude)
+        target: str | None = self.target.column
+        target_encoder: MapValues | None = self.target.build()
+        if not include_target:
+            if target in columns and target not in exclude:
+                exclude.append(target)
+            target = None
+            target_encoder = None
+        return TableSchema.from_columns(
+            columns,
+            target=target,
+            metadata=metadata,
+            exclude=exclude,
+            feature_encoders={
+                item.column: item.build() for item in self.encodings
+            },
+            target_encoder=target_encoder,
+        )
 
 
 class ScaleByCapConfig(_Config):
@@ -55,74 +118,63 @@ class ScaleByCapConfig(_Config):
     column: str
     cap: float
     floor: float = 0.0
+    stages: list[Stage] = ["train", "eval", "predict"]
 
-    def build(self) -> Transform:
-        return ScaleByCap(self.column, self.cap, self.floor)
+    def build(
+        self, schema: TableSchema
+    ) -> tuple[ProcessingStep, frozenset[Stage]]:
+        step = ScaleByCap(
+            schema.feature_slice(self.column), self.cap, self.floor
+        )
+        return step, frozenset(self.stages)
 
 
 class LogScaleByCapConfig(_Config):
     kind: Literal["log_scale_by_cap"] = "log_scale_by_cap"
     column: str
     cap: float
+    stages: list[Stage] = ["train", "eval", "predict"]
 
-    def build(self) -> Transform:
-        return LogScaleByCap(self.column, self.cap)
-
-
-class OneHotConfig(_Config):
-    kind: Literal["one_hot"] = "one_hot"
-    column: str
-    levels: list[str]
-
-    def build(self) -> Transform:
-        return OneHot(self.column, self.levels)
+    def build(
+        self, schema: TableSchema
+    ) -> tuple[ProcessingStep, frozenset[Stage]]:
+        step = LogScaleByCap(schema.feature_slice(self.column), self.cap)
+        return step, frozenset(self.stages)
 
 
-class MapValuesConfig(_Config):
-    kind: Literal["map_values"] = "map_values"
-    column: str
-    mapping: dict[str, int]
-
-    def build(self) -> Transform:
-        return MapValues(self.column, self.mapping)
-
-
-TransformConfig = Annotated[
-    DropColumnsConfig
-    | ScaleByCapConfig
-    | LogScaleByCapConfig
-    | OneHotConfig
-    | MapValuesConfig,
-    Field(discriminator="kind"),
-]
-
-
-class PipelineConfig(_Config):
-    steps: list[TransformConfig] = []
-
-    def build(self) -> Pipeline:
-        return Pipeline([step.build() for step in self.steps])
-
-
-class IdentityAugmenterConfig(_Config):
-    kind: Literal["identity"] = "identity"
-
-    def build(self) -> Augmenter:
-        return IdentityAugmenter()
-
-
-class GaussianNoiseAugmenterConfig(_Config):
+class GaussianNoiseConfig(_Config):
     kind: Literal["gaussian_noise"] = "gaussian_noise"
     std: float = Field(gt=0)
+    stages: list[Stage] = ["train"]
 
-    def build(self) -> Augmenter:
-        return GaussianNoiseAugmenter(self.std)
+    def build(
+        self, schema: TableSchema
+    ) -> tuple[ProcessingStep, frozenset[Stage]]:
+        return GaussianNoise(self.std), frozenset(self.stages)
 
 
-AugmenterConfig = Annotated[
-    IdentityAugmenterConfig | GaussianNoiseAugmenterConfig,
+ProcessingStepConfig = Annotated[
+    ScaleByCapConfig | LogScaleByCapConfig | GaussianNoiseConfig,
     Field(discriminator="kind"),
 ]
+
+
+class ProcessingConfig(_Config):
+    """One ordered step list: preprocessing and augmentation interleave.
+
+    Stacking is list order (`pre -> aug -> pre` needs no phases); each step
+    names the stages it runs in. Deterministic steps default to every
+    stage (predict-time scaling is part of the feature definition),
+    stochastic steps to `train` only — tag them `eval` for seeded
+    validation-time augmentation.
+    """
+
+    steps: list[ProcessingStepConfig] = []
+
+    def build(self, schema: TableSchema) -> ProcessingPipeline:
+        return ProcessingPipeline(
+            [step.build(schema) for step in self.steps]
+        )
 
 
 class NullTrackerConfig(_Config):
@@ -154,26 +206,6 @@ TrackerConfig = Annotated[
     NullTrackerConfig | StdoutTrackerConfig | MLflowTrackerConfig,
     Field(discriminator="kind"),
 ]
-
-
-class TargetConfig(_Config):
-    column: str
-    mapping: dict[str, int]
-
-    @model_validator(mode="after")
-    def _validate_mapping(self) -> Self:
-        if not self.mapping:
-            raise ValueError("target mapping must not be empty")
-        if len(set(self.mapping.values())) != len(self.mapping):
-            raise ValueError("target mapping must be injective")
-        return self
-
-
-class DataConfig(_Config):
-    train_path: Path
-    test_path: Path
-    id_column: str = "id"
-    target: TargetConfig
 
 
 class ModelConfig(_Config):
@@ -244,7 +276,6 @@ class TrainingConfig(_Config):
     shuffle: bool = True
     device: str = "auto"
     trackers: list[TrackerConfig] = [StdoutTrackerConfig()]
-    augmenter: AugmenterConfig | None = None
     track_gradients: bool = False
     checkpoint_path: Path
 
@@ -258,7 +289,7 @@ class InferenceConfig(_Config):
 
 class ExperimentConfig(_Config):
     data: DataConfig
-    pipeline: PipelineConfig
+    processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
     model: ModelConfig
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
     loss: LossConfig = Field(default_factory=LossConfig)
