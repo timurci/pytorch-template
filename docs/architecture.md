@@ -14,10 +14,12 @@ Two principles do most of the work:
    (`Batch`). Swapping an implementation — a tracker, a processing step, a
    model — touches no other layer.
 2. **Config is the composition root.** One YAML file describes the whole
-   experiment; Pydantic schemas in the CLI layer validate it and `build()`
-   plain library objects. Library layers never see config objects — they take
-   plain constructor arguments, which keeps them testable and reusable from
-   notebooks, scripts, or services without the CLI.
+   experiment; Pydantic schemas validate it and `build()` plain library
+   objects. Each schema lives in the layer of the class it builds; the CLI
+   assembles them into `ExperimentConfig` and does the wiring. Library
+   objects never see config objects — they take plain constructor
+   arguments, which keeps them testable and reusable from notebooks,
+   scripts, or services without the CLI.
 
 The structure resembles an FTI (feature / training / inference) pipeline:
 ingestion plus feature processing and their config are the *feature pipeline*,
@@ -29,13 +31,13 @@ serves.
 
 | Layer | Role | Owns | Must not |
 | --- | --- | --- | --- |
-| `persistence` | Raw table readers + persistent I/O | `CsvSource` / `ParquetSource` (raw, unvalidated rows by index), `save_table`, `save_checkpoint` / `load_checkpoint` | Know about validated forms, datasets, models, or training; validate structure; pick its own paths (callers supply them) |
-| `data` | Ingestion contracts + the torch-side dataset adapter | `RawTableSource` / `DataSource` ports; `TableSchema` (roles + encodings) and the encoders (`OneHot`, `MapValues`); `ValidatedTable` / `ValidatedSource`; `Batch` TypedDict; `TableDataset`; `partition_indices` / `class_counts` | File I/O (rows arrive through the ports); import anything from sibling layers |
-| `features` | Feature processing | `ProcessingStep` protocol + `ProcessingPipeline` (ordered, stage-tagged steps over batches); `ScaleByCap`, `LogScaleByCap`, `GaussianNoise` | File I/O; raw forms or column names (tensor-only); fitting state from data |
-| `models` | Network definitions | `nn.Module` subclasses, e.g. `MLPClassifier` | Anything but `torch` |
-| `tracking` | Observability port | `ExperimentTracker` protocol; `Null` / `Stdout` / `MLflow` adapters | Owning external lifecycles (the CLI opens/closes the MLflow run) |
+| `persistence` | Raw table readers + persistent I/O | `CsvSource` / `ParquetSource` (raw, unvalidated rows by index), `save_table`, `save_checkpoint` / `load_checkpoint`, and their `config.py` schemas | Know about validated forms, datasets, models, or training; validate structure; pick its own paths (callers supply them) |
+| `data` | Ingestion contracts + the torch-side dataset adapter | `RawTableSource` / `DataSource` ports; `TableSchema` (roles + encodings) and the encoders (`OneHot`, `MapValues`) with their `config.py` schemas; `ValidatedTable` / `ValidatedSource`; `Batch` TypedDict; `TableDataset`; `partition_indices` / `class_counts` | File I/O (rows arrive through the ports); import anything from sibling layers |
+| `features` | Feature processing | `ProcessingStep` protocol + `ProcessingPipeline` (ordered, stage-tagged steps over batches); `ScaleByCap`, `LogScaleByCap`, `GaussianNoise`, and their `config.py` schemas | File I/O; raw forms or column names in steps (config declares names, resolved at build); fitting state from data |
+| `models` | Network definitions | `nn.Module` subclasses, e.g. `MLPClassifier`; `models/config.py` schemas | Anything but `torch` (its `config.py` may add `pydantic`) |
+| `tracking` | Observability port | `ExperimentTracker` protocol; `Null` / `Stdout` / `MLflow` adapters, and their `config.py` schemas | Owning external lifecycles (the CLI opens/closes the MLflow run) |
 | `training` | The training loop | `Trainer` | Touching sources or splitting data, building models/loaders, checkpointing, opening tracker runs |
-| `cli` | Entrypoints / composition root | Config schemas and their `build()` methods, `template-train`, `template-infer` | Contain business logic — it only wires layers |
+| `cli` | Entrypoints / composition root | The composition-root schema (`cli/config.py`: `ExperimentConfig`, `DataConfig`, `TrainingConfig` / `InferenceConfig`, optimizer/loss schemas) and the `build()` wiring, `template-train`, `template-infer` | Contain business logic — it only wires layers |
 
 ## Dependency rules
 
@@ -60,6 +62,9 @@ The allowed edges, exactly:
 
 - `features` → `data`: **`Batch` only** — steps consume and return the batch
   contract; that single edge is why the batch is owned by `data` (below).
+  Step schemas resolve column names through `BlockResolver`
+  (`features/protocol.py`), structurally satisfied by `data.TableSchema`,
+  so config adds no import edge.
 - `training` → `data.Batch`, `features.ProcessingPipeline` /
   `features.Stage`, `tracking.ExperimentTracker`, plus `torch`'s own
   `nn.Module`, `Optimizer`, and `DataLoader`.
@@ -272,7 +277,7 @@ other. The trainer fans metrics out to a sequence of them. External
 lifecycles belong to the entrypoint — the CLI opens the MLflow run around
 training; `MLflowTracker` just logs into the active run. New backends (W&B,
 TensorBoard, a database) are added by implementing the two methods and
-registering a new `kind` in the config union.
+registering a new `kind` in `tracking/config.py`'s union.
 
 ## Training
 
@@ -302,26 +307,34 @@ loop instead of a false abstraction. Regression or ranking tasks rewrite
 
 ## Configuration as composition root
 
-One YAML file describes the whole experiment: data paths and column roles,
-feature processing, model, optimizer, loss, training loop, inference output.
-The pattern:
+One YAML file describes the whole experiment: data sources and column
+roles, feature processing, model, optimizer, loss, training loop,
+inference output. The pattern (normative detail and extension recipes:
+[config-pattern.md](config-pattern.md)):
 
-- Pydantic schemas live **only** in `cli/config.py`; library layers never
-  import them. That module is the composition root: the only place that
-  knows both the config file format and the library constructors.
-- Every schema has a `build()` method returning plain library objects, so
-  the library stays config-free and constructor-driven. Column names are
-  config-level declarations; they resolve to feature-tensor blocks when the
-  processing pipeline is built, so processing steps stay tensor-only.
-- Polymorphic slots (encodings, processing steps, trackers, optimizers) use
-  a `kind` discriminator: adding an implementation = new class in its layer
-  + new `*Config` schema added to the union.
-- `extra="forbid"` everywhere: misspelled keys fail fast at load time.
-- Cross-field invariants (e.g. target mapping covers exactly
-  `0..n_classes-1`) are model validators on the schema.
-- Both entrypoints validate the *whole* file, so a typo in the inference
-  section fails training too — one file is the single source of truth for
-  "what experiment is this".
+- Each schema lives **with the class it builds**, in its layer's
+  `config.py` (`template.models.config`, `template.persistence.config`,
+  ...); library classes stay constructor-driven and config-free. The
+  composition root's own schema (`cli/config.py`) adds `ExperimentConfig`
+  (assembly + cross-object invariants) and the run-level schemas no layer
+  owns: `DataConfig` (which raw sources feed the run, column roles),
+  `TrainingConfig` / `InferenceConfig`, and the optimizer/loss schemas
+  over plain `torch` objects.
+- Every schema has a `build()` method returning plain library objects.
+  Column names are config-level declarations; they resolve to
+  feature-tensor blocks when the processing pipeline is built, so
+  processing steps stay tensor-only.
+- Polymorphic slots (sources, encodings, processing steps, models,
+  optimizers, losses, trackers) use a `kind` discriminator: adding an
+  implementation = new class in its layer + new `*Config` schema added to
+  the union. The slot's union is its type from day one, even with a single
+  member.
+- Cross-field invariants (e.g. the target mapping covers exactly the
+  classifier's `0..n_classes-1`) are model validators on `ExperimentConfig`.
+- `load_config` is the only place the file is read, and both entrypoints
+  validate the *whole* file, so a typo in the inference section fails
+  training too — one file is the single source of truth for "what
+  experiment is this".
 
 This is where "configurable setups" fit architecturally: configuration is
 not a layer of its own, it is the composition root that replaces a
@@ -333,20 +346,21 @@ hand-written `main()` wiring function with a declarative, validated file.
 presentation and application layers — for a training project that split is
 ceremony, so the CLI both parses args/config and orchestrates the use case:
 
-`template-train`: `CsvSource` → `TableSchema.from_columns` (roles + encodings
-resolved from the raw columns; the resolved feature set and width are logged
-on purpose — a stray or leaky column surfaces in the logs and tracked params
-instead of inside the model) → `ValidatedSource` → `partition_indices` →
-`TableDataset` + `Subset` loaders → `MLPClassifier(schema.feature_width, …)`
-on device → open trackers, log flattened config as params →
-`Trainer.train(processing=…, seed=…)` → `save_checkpoint`.
+`template-train`: `config.data.train.build()` → `TableSchema.from_columns`
+(roles + encodings resolved from the raw columns; the resolved feature set
+and width are logged on purpose — a stray or leaky column surfaces in the
+logs and tracked params instead of inside the model) → `ValidatedSource` →
+`partition_indices` → `TableDataset` + `Subset` loaders →
+`config.model.build(schema.feature_width)` on device → open trackers, log
+flattened config as params → `Trainer.train(processing=…, seed=…)` →
+`save_checkpoint`.
 
-`template-infer`: `CsvSource` → schema built with `include_target=False`
-(target dropped when present, absent otherwise) → ids read through the
-validated source (metadata rides through untouched, row order preserved) →
-model rebuilt from config, `state_dict` loaded, `eval()` → per batch:
-processing at stage `predict`, then `softmax(logits, dim=1)[:, 1]` →
-report/save `id,<target>`.
+`template-infer`: `config.data.test.build()` → schema built with
+`include_target=False` (target dropped when present, absent otherwise) →
+ids read through the validated source (metadata rides through untouched,
+row order preserved) → model rebuilt from the same config, `state_dict`
+loaded, `eval()` → per batch: processing at stage `predict`, then
+`softmax(logits, dim=1)[:, 1]` → report/save `id,<target>`.
 
 A backend API entrypoint would do the same wiring inside request handlers
 instead of `argparse` mains; nothing in the library changes.
@@ -363,10 +377,13 @@ instead of `argparse` mains; nothing in the library changes.
 3. Add the processing steps your domain needs to `features` (+ their config
    kinds); extend `ProcessingStep` invariants if your steps do something the
    current contract forbids.
-4. Replace `MLPClassifier` with your architecture(s).
+4. Add your architecture(s) as `kind`s in `models/config.py` (or replace
+   `MLPClassifier` outright).
 5. If the task isn't classification, rewrite `training/trainer.py` for your
-   metrics and `cli` model/loss schemas to match.
-6. Wire the config schema in `cli/config.py` to the new pieces; update
+   metrics and the model/loss schemas to match.
+6. Give every new component an `XConfig` in its layer's `config.py` and
+   register its `kind` in the slot's union
+   ([config-pattern.md](config-pattern.md) has recipes); update
    `configs/example.yaml.example` and `docs/cli.md`.
 7. Add trackers as needed (W&B etc.) as new `kind`s.
 

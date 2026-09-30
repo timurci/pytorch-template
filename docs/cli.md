@@ -20,7 +20,11 @@ Both commands validate the whole file, so a typo anywhere fails fast. Run
 - `-c/--config` is required and must point to a YAML mapping.
 - Paths are relative to the working directory, not to the config file.
 - Unknown fields are rejected, so misspelled keys are errors.
-- Target mapping values must be exactly `0..model.n_classes-1`.
+- `kind` may be omitted only where a section declares a default kind
+  (`model` → `mlp`, `optimizer` → `adamw`, `loss` → `cross_entropy`);
+  sources, encodings, steps, and trackers require it.
+- Target mapping values must be exactly the model's class indices
+  (`0..n_classes-1` for `kind: mlp`).
 
 `configs/example.yaml.example` is the commented reference. `configs/*.yaml`
 is gitignored, so copy the template before running:
@@ -28,6 +32,12 @@ is gitignored, so copy the template before running:
 ```bash
 cp configs/example.yaml.example configs/example.yaml
 ```
+
+Sections are typed; slots that pick an implementation are `kind`-tagged
+unions (sources, encodings, steps, model, optimizer, loss, trackers). A
+section with a default kind may omit the tag; see the bullets above. The
+schema pattern and how to add a `kind`:
+[config-pattern.md](config-pattern.md).
 
 ## Sections
 
@@ -40,14 +50,22 @@ width are logged at startup.
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `train_path` | path | required | used by `template-train` |
-| `test_path` | path | required | used by `template-infer` |
+| `train` | source | required | raw reader for `template-train`, picked by `kind` |
+| `test` | source | required | raw reader for `template-infer`, picked by `kind` |
 | `id_column` | str | `id` | always metadata: kept untouched and reassembled into the predictions (merged into `metadata`) |
 | `target.column` | str | required | label column; also the prediction column name |
 | `target.mapping` | map[str, int] | required | class indices; non-empty, injective, must cover exactly `0..n_classes-1` |
 | `metadata` | [str] | `[]` | columns kept untouched as sample identity; must not overlap `target` / `exclude` |
 | `exclude` | [str] | `[]` | dropped columns; must not overlap `metadata` / `target` |
 | `encodings` | list | `[]` | feature encodings; see below |
+
+`train` / `test` are raw readers (`data.RawTableSource` implementations),
+selected by `kind`:
+
+| `kind` | Fields | Behavior |
+| --- | --- | --- |
+| `csv` | `path` | whole CSV loaded at construction, rows served by index |
+| `parquet` | `path` | whole Parquet file loaded at construction, rows served by index |
 
 A metadata column is never a feature; the target is never a feature
 (leakage). A column cannot be both feature and metadata through this config
@@ -87,9 +105,10 @@ fails at build. `stages` picks where a step runs:
 
 `stages` defaults to `[train, eval, predict]` for the deterministic scales
 (predict-time scaling is part of the feature definition) and to `[train]`
-for `gaussian_noise`. Steps never mutate their input, and row-changing steps
-keep `source_indices` / `targets` aligned; see
-[architecture.md](architecture.md#feature-processing) for the contract.
+for `gaussian_noise`; it must name at least one stage. Steps never mutate
+their input, and row-changing steps keep `source_indices` / `targets`
+aligned; see [architecture.md](architecture.md#feature-processing) for the
+contract.
 
 Seeded validation-time augmentation is a stage tag, not a code change:
 
@@ -106,8 +125,11 @@ stage `predict` with a generator seeded from `training.seed`.
 
 ### `model`
 
+Selected by `kind`; this template ships `mlp`:
+
 | Field | Default | Notes |
 | --- | --- | --- |
+| `kind` | `mlp` | architecture selector; new kinds live in `models/config.py` ([config-pattern.md](config-pattern.md)) |
 | `hidden_size` | 128 | width of each hidden block |
 | `hidden_depth` | 2 | number of `Linear -> ReLU -> LayerNorm -> Dropout` blocks |
 | `n_classes` | 2 | logits; pair with `cross_entropy` |
@@ -181,7 +203,7 @@ features: ('age', 'income', 'city') (width 5)
 train target distribution: 0=900 (75.00%), 1=300 (25.00%)
 val target distribution: 0=99 (73.88%), 1=35 (26.12%)
 device=cpu rows=1200+134 epochs=10
-params {'data.train_path': 'data/train.csv', ..., 'processing.steps': '[...]', ...}
+params {'data.train.kind': 'csv', ..., 'processing.steps': '[...]', ...}
 step=0 metrics {'train/loss': 0.2421, 'train/accuracy': 0.8897, ...}
 step=0 metrics {'val/loss': 0.2379, 'val/accuracy': 0.8925, ...}
 saved checkpoint to outputs/model.pt
@@ -206,7 +228,8 @@ saved predictions to outputs/predictions.csv
 
 `template-train`:
 
-1. `CsvSource(data.train_path)`; `TableSchema.from_columns` resolves roles
+1. `data.train.build()` (the `kind`-picked raw reader);
+   `TableSchema.from_columns` resolves roles
    and encodings from the raw columns (`metadata` + `id_column` as metadata,
    `exclude` and the target out, everything else features) and logs the
    resolved feature set and width. Bad declarations (unknown columns,
@@ -217,7 +240,8 @@ saved predictions to outputs/predictions.csv
    target distribution is logged.
 4. Build `TableDataset` over the source and `Subset` train/validation
    `DataLoader`s; `input_size` is `schema.feature_width`.
-5. Build `MLPClassifier` on `device`, the optimizer, the loss; the processing
+5. Build the model (`model.build(schema.feature_width)`) on `device`, the
+   optimizer, the loss; the processing
    pipeline is built from `processing.steps` against the schema.
    `loss.class_weights: balanced` resolves inverse-frequency weights from
    the train partition's class counts.
@@ -228,7 +252,8 @@ saved predictions to outputs/predictions.csv
 
 `template-infer`:
 
-1. `CsvSource(data.test_path)`; the schema is built with
+1. `data.test.build()` (the `kind`-picked raw reader); the schema is built
+   with
    `include_target=False` (the target is excluded when present, absent
    otherwise). Ids are read through the validated source as metadata: they
    ride through ingestion untouched and row order is preserved.

@@ -21,8 +21,7 @@ from template.data import (
     class_counts,
     partition_indices,
 )
-from template.models import MLPClassifier
-from template.persistence import CsvSource, save_checkpoint
+from template.persistence import save_checkpoint
 from template.training import Trainer
 
 logger = logging.getLogger(__name__)
@@ -34,7 +33,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = load_config(args.config)
     device = resolve_device(config.training.device)
 
-    raw = CsvSource(config.data.train_path)
+    raw = config.data.train.build()
     schema = config.data.build_schema(raw.columns)
     # The resolved feature set is loud on purpose: a stray or leaky column
     # shows up here (and in the tracked params) instead of in the model.
@@ -86,13 +85,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
 
     processing = config.processing.build(schema)
-    model = MLPClassifier(
-        schema.feature_width,
-        config.model.hidden_size,
-        config.model.hidden_depth,
-        config.model.n_classes,
-        config.model.dropout,
-    ).to(device)
+    model = config.model.build(schema.feature_width).to(device)
     optimizer = config.optimizer.build(model.parameters())
     loss_fn = config.loss.build(train_counts).to(device)
 

@@ -33,3 +33,14 @@ class ProcessingStep(Protocol):
     """One processing step over batched tensors."""
 
     def process(self, batch: Batch, rng: Generator) -> Batch: ...
+
+
+class BlockResolver(Protocol):
+    """Resolves a feature column name to its block of the feature tensor.
+
+    Satisfied structurally by `data.TableSchema`, so feature-processing
+    config can name columns while this layer keeps its `Batch`-only edge
+    into `data` — the same no-import trick as the raw readers.
+    """
+
+    def feature_slice(self, column: str) -> slice: ...
