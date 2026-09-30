@@ -1,11 +1,18 @@
 # Shared experiment config template.
 # `template-train` and `template-infer` both validate this file; each uses its
-# own sections. See docs/cli.md for the full field reference.
+# own sections. See docs/cli.md for the full field reference, and
+# docs/config-pattern.md for the schema pattern and how to add a `kind`.
 # Paths are relative to the working directory.
 
 data:
-  train_path: data/train.csv
-  test_path: data/test.csv
+  # Raw readers are picked by `kind`: csv | parquet. A new reader kind is
+  # one schema in persistence/config.py (docs/config-pattern.md).
+  train:
+    kind: csv
+    path: data/train.csv
+  test:
+    kind: csv
+    path: data/test.csv
   id_column: id # always metadata: kept untouched, reassembled into predictions
   target:
     column: label
@@ -55,6 +62,9 @@ processing:
     #   stages: [eval]
 
 model:
+  # Architectures are picked by `kind`; this template ships `mlp`. A new
+  # kind is one schema in models/config.py (docs/config-pattern.md).
+  kind: mlp
   hidden_size: 128
   hidden_depth: 2 # Linear -> ReLU -> LayerNorm -> Dropout blocks
   n_classes: 2 # input size is the schema's feature width (known before any row is read)

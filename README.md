@@ -6,7 +6,9 @@ at the entrypoints by one validated YAML config. Not specific to any task or
 dataset — copy it, rename the package, and adapt the marked pieces.
 
 The architecture is documented in [docs/architecture.md](docs/architecture.md)
-— start there. In short:
+— start there. The config pattern — every schema's shape and how to make a
+new component (model, source, step, tracker) configurable — is
+[docs/config-pattern.md](docs/config-pattern.md). In short:
 
 | Layer | Role |
 | --- | --- |
@@ -16,7 +18,7 @@ The architecture is documented in [docs/architecture.md](docs/architecture.md)
 | `models` | `nn.Module` architectures (reference: `MLPClassifier`) |
 | `tracking` | `ExperimentTracker` protocol; `null` / `stdout` / `mlflow` adapters |
 | `training` | `Trainer`: the epoch loop; applies the processing pipeline per batch; trackers injected |
-| `cli` | Entrypoints (`template-train` / `template-infer`); Pydantic config as composition root |
+| `cli` | Entrypoints (`template-train` / `template-infer`); the composition-root schema (`cli/config.py`) and wiring |
 
 ## Quickstart
 
@@ -39,7 +41,9 @@ field reference: [docs/cli.md](docs/cli.md).
 2. Adapt the marked layers to your task: `data.Batch` + the dataset adapter
    (+ the source ports if your raw form is not a table), your models, your
    processing steps, your trainer specialization.
-3. Wire new implementations into the `kind` unions in `cli/config.py`.
+3. Give each new implementation an `XConfig` in its layer's `config.py` and
+   register it in the slot's `kind` union
+   ([docs/config-pattern.md](docs/config-pattern.md) has recipes).
 
 Step-by-step: [docs/architecture.md#instantiating-the-template](docs/architecture.md#instantiating-the-template).
 

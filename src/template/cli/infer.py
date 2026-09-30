@@ -12,8 +12,7 @@ from torch.utils.data import DataLoader
 from template.cli.config import load_config
 from template.cli.runtime import configure_logging
 from template.data import TableDataset, ValidatedSource
-from template.models import MLPClassifier
-from template.persistence import CsvSource, load_checkpoint, save_table
+from template.persistence import load_checkpoint, save_table
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +22,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     config = load_config(args.config)
 
-    raw = CsvSource(config.data.test_path)
+    raw = config.data.test.build()
     schema = config.data.build_schema(raw.columns, include_target=False)
     source = ValidatedSource(raw, schema)
     # Ids are metadata: they ride through ingestion untouched (row order is
@@ -34,13 +33,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     processing = config.processing.build(schema)
 
     dataset = TableDataset(source)
-    model = MLPClassifier(
-        schema.feature_width,
-        config.model.hidden_size,
-        config.model.hidden_depth,
-        config.model.n_classes,
-        config.model.dropout,
-    )
+    model = config.model.build(schema.feature_width)
     model.load_state_dict(load_checkpoint(config.training.checkpoint_path))
     model.eval()
 

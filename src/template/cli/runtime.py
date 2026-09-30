@@ -10,8 +10,8 @@ from typing import Any
 import mlflow
 import torch
 
-from template.cli.config import (
-    ExperimentConfig,
+from template.cli.config import ExperimentConfig
+from template.tracking.config import (
     MLflowTrackerConfig,
     StdoutTrackerConfig,
     TrackerConfig,
@@ -64,9 +64,11 @@ def tracking(
 def _build_tracker(
     config: TrackerConfig, total_steps: int | None
 ) -> ExperimentTracker:
-    if isinstance(config, StdoutTrackerConfig):
-        return config.build(total_steps=total_steps)
-    return config.build()
+    match config:
+        case StdoutTrackerConfig():
+            return config.build(total_steps=total_steps)
+        case _:
+            return config.build()
 
 
 def flatten_params(config: ExperimentConfig) -> dict[str, object]:
