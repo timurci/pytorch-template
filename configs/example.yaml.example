@@ -76,6 +76,18 @@ optimizer:
   weight_decay: 0.0001
   # momentum: 0.0 # sgd only
 
+# Omit `scheduler` to keep `optimizer.lr` constant. When present, `kind` is
+# required. The trainer calls `step()` once after each epoch, so step_size,
+# milestones, and t_max count epochs. The first epoch runs at optimizer.lr.
+# Kinds: step {step_size, gamma} | multistep {milestones, gamma} |
+# exponential {gamma} | cosine {t_max, eta_min}.
+# Not available: ReduceLROnPlateau (needs a metric) and per-batch schedules
+# (OneCycleLR, CyclicLR).
+# scheduler:
+#   kind: cosine
+#   t_max: 10
+#   eta_min: 0.0
+
 loss:
   kind: cross_entropy # model returns logits
   # class_weights: balanced # or null (default); inverse-frequency weights

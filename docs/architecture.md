@@ -10,9 +10,9 @@ Two principles do most of the work:
 1. **Layers depend on contracts, not on each other's implementations.**
    Cross-layer references are `typing.Protocol`s (`RawTableSource`,
    `DataSource`, `ProcessingStep`, `ExperimentTracker`), `torch` abstractions
-   (`nn.Module`, `Optimizer`, `DataLoader`), or one shared data contract
-   (`Batch`). Swapping an implementation — a tracker, a processing step, a
-   model — touches no other layer.
+   (`nn.Module`, `Optimizer`, `LRScheduler`, `DataLoader`), or one shared
+   data contract (`Batch`). Swapping an implementation — a tracker, a
+   processing step, a model — touches no other layer.
 2. **Config is the composition root.** One YAML file describes the whole
    experiment; Pydantic schemas validate it and `build()` plain library
    objects. Each schema lives in the layer of the class it builds; the CLI
@@ -36,8 +36,8 @@ serves.
 | `features` | Feature processing | `ProcessingStep` protocol + `ProcessingPipeline` (ordered, stage-tagged steps over batches); `ScaleByCap`, `LogScaleByCap`, `GaussianNoise`, and their `config.py` schemas | File I/O; raw forms or column names in steps (config declares names, resolved at build); fitting state from data |
 | `models` | Network definitions | `nn.Module` subclasses, e.g. `MLPClassifier`; `models/config.py` schemas | Anything but `torch` (its `config.py` may add `pydantic`) |
 | `tracking` | Observability port | `ExperimentTracker` protocol; `Null` / `Stdout` / `MLflow` adapters, and their `config.py` schemas | Owning external lifecycles (the CLI opens/closes the MLflow run) |
-| `training` | The training loop | `Trainer` | Touching sources or splitting data, building models/loaders, checkpointing, opening tracker runs |
-| `cli` | Entrypoints / composition root | The composition-root schema (`cli/config.py`: `ExperimentConfig`, `DataConfig`, `TrainingConfig` / `InferenceConfig`, optimizer/loss schemas) and the `build()` wiring, `template-train`, `template-infer` | Contain business logic — it only wires layers |
+| `training` | The training loop | `Trainer` | Touching sources or splitting data, building models/loaders/schedulers, checkpointing, opening tracker runs |
+| `cli` | Entrypoints / composition root | The composition-root schema (`cli/config.py`: `ExperimentConfig`, `DataConfig`, `TrainingConfig` / `InferenceConfig`, optimizer/scheduler/loss schemas) and the `build()` wiring, `template-train`, `template-infer` | Contain business logic — it only wires layers |
 
 ## Dependency rules
 
@@ -67,7 +67,7 @@ The allowed edges, exactly:
   so config adds no import edge.
 - `training` → `data.Batch`, `features.ProcessingPipeline` /
   `features.Stage`, `tracking.ExperimentTracker`, plus `torch`'s own
-  `nn.Module`, `Optimizer`, and `DataLoader`.
+  `nn.Module`, `Optimizer`, `LRScheduler`, and `DataLoader`.
 - `persistence` and `data` import nothing from sibling layers at all: raw
   readers are plain classes whose methods (`columns`, `count`,
   `read(indices) -> pl.DataFrame`) satisfy `data.RawTableSource`
@@ -75,9 +75,9 @@ The allowed edges, exactly:
   each other (and `polars` / `torch`).
 - `models` and `tracking` import nothing from sibling layers.
 
-Everything else (constructing the model, the optimizer, the loaders, the
-trackers, the processing pipeline, saving checkpoints) happens in the
-entrypoint and is passed in.
+Everything else (constructing the model, the optimizer, the scheduler, the
+loaders, the trackers, the processing pipeline, saving checkpoints) happens
+in the entrypoint and is passed in.
 
 ## The batch contract
 
@@ -281,34 +281,45 @@ registering a new `kind` in `tracking/config.py`'s union.
 
 ## Training
 
-`Trainer(model, optimizer, device=...)` owns exactly one thing: the
-train/validation epoch loop — moving batches to the device, applying the
-processing pipeline, forward/backward/step, computing metrics, fanning out
-to trackers. The pipeline runs on each batch *after* the move to `device`:
-training batches at stage `train`, validation batches at stage `eval` (so
-seeded validation-time augmentation is a tagging choice in the pipeline, not
-trainer code). Processed features and labels replace the batch — metrics
-therefore describe the processed data.
+`Trainer(model, optimizer, scheduler=None, device=...)` owns exactly one
+thing: the train/validation epoch loop — moving batches to the device,
+applying the processing pipeline, forward/backward/step, computing metrics,
+fanning out to trackers. The pipeline runs on each batch *after* the move
+to `device`: training batches at stage `train`, validation batches at stage
+`eval` (so seeded validation-time augmentation is a tagging choice in the
+pipeline, not trainer code). Processed features and labels replace the
+batch — metrics therefore describe the processed data.
+
+An optional `torch.optim.lr_scheduler.LRScheduler` is stepped once after
+each epoch, after validation when there is a validation loader, with no
+arguments — the call site in PyTorch's own scheduler examples. The
+scheduler's unit is that call, so `step_size`, milestones, and `T_max`
+count epochs. `None` leaves the optimizer's learning rate unchanged. The
+scheduler must wrap the trainer's optimizer. `ReduceLROnPlateau` is
+rejected at construction: its `step` requires a metric. Iteration-level
+schedules (`OneCycleLR`, `CyclicLR`) are out of scope for the same reason
+— the loop has one cadence, the epoch. Each train epoch logs `train/lr`,
+the first param group's rate during that epoch, before the scheduler steps.
 
 Explicit non-responsibilities, all handled by the caller:
 
 - no train/val splitting (`partition_indices` + `Subset` do it),
 - no data access (it sees `DataLoader[Batch]`, never a source),
-- no model/optimizer/loss/loader construction,
+- no model/optimizer/scheduler/loss/loader construction,
 - no checkpointing (persistence functions, called by the CLI),
 - no tracker lifecycle management.
 
 The shipped loop is the *classification* specialization: it expects logits
-`(N, C)` and reports loss, accuracy, per-class precision/recall/F1, and
-unweighted macro means. This is deliberate — per the batch-contract section,
-a loop is wedded to its task, so the template ships one concrete reference
-loop instead of a false abstraction. Regression or ranking tasks rewrite
-`trainer.py` (and probably `Batch`) for their project.
+`(N, C)` and reports loss, accuracy, per-class precision/recall/F1,
+unweighted macro means, and `train/lr`. This is deliberate — per the
+batch-contract section, a loop is wedded to its task, so the template ships
+one concrete reference loop instead of a false abstraction. Regression or
+ranking tasks rewrite `trainer.py` (and probably `Batch`) for their project.
 
 ## Configuration as composition root
 
 One YAML file describes the whole experiment: data sources and column
-roles, feature processing, model, optimizer, loss, training loop,
+roles, feature processing, model, optimizer, scheduler, loss, training loop,
 inference output. The pattern (normative detail and extension recipes:
 [config-pattern.md](config-pattern.md)):
 
@@ -318,17 +329,17 @@ inference output. The pattern (normative detail and extension recipes:
   composition root's own schema (`cli/config.py`) adds `ExperimentConfig`
   (assembly + cross-object invariants) and the run-level schemas no layer
   owns: `DataConfig` (which raw sources feed the run, column roles),
-  `TrainingConfig` / `InferenceConfig`, and the optimizer/loss schemas
-  over plain `torch` objects.
+  `TrainingConfig` / `InferenceConfig`, and the optimizer/scheduler/loss
+  schemas over plain `torch` objects.
 - Every schema has a `build()` method returning plain library objects.
   Column names are config-level declarations; they resolve to
   feature-tensor blocks when the processing pipeline is built, so
   processing steps stay tensor-only.
 - Polymorphic slots (sources, encodings, processing steps, models,
-  optimizers, losses, trackers) use a `kind` discriminator: adding an
-  implementation = new class in its layer + new `*Config` schema added to
-  the union. The slot's union is its type from day one, even with a single
-  member.
+  optimizers, schedulers, losses, trackers) use a `kind` discriminator:
+  adding an implementation = new class in its layer + new `*Config` schema
+  added to the union. The slot's union is its type from day one, even with
+  a single member.
 - Cross-field invariants (e.g. the target mapping covers exactly the
   classifier's `0..n_classes-1`) are model validators on `ExperimentConfig`.
 - `load_config` is the only place the file is read, and both entrypoints
@@ -351,7 +362,8 @@ ceremony, so the CLI both parses args/config and orchestrates the use case:
 and width are logged on purpose — a stray or leaky column surfaces in the
 logs and tracked params instead of inside the model) → `ValidatedSource` →
 `partition_indices` → `TableDataset` + `Subset` loaders →
-`config.model.build(schema.feature_width)` on device → open trackers, log
+`config.model.build(schema.feature_width)` on device → optimizer, then the
+scheduler around that optimizer when configured → open trackers, log
 flattened config as params → `Trainer.train(processing=…, seed=…)` →
 `save_checkpoint`.
 

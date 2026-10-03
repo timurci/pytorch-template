@@ -58,8 +58,8 @@ composition root's own schema:
   file, plus cross-object invariants (below);
 - run-level schemas no library layer owns: `DataConfig` (which raw sources
   feed the run, plus column roles), `TrainingConfig` / `InferenceConfig`
-  (the run itself), and `OptimizerConfig` / `LossConfig` (plain `torch`
-  objects — no layer owns them).
+  (the run itself), and `OptimizerConfig` / `SchedulerConfig` /
+  `LossConfig` (plain `torch` objects — no layer owns them).
 
 The *wiring* — who calls `build()` with what and passes the result where —
 belongs to the entrypoints (`cli/train.py`, `cli/infer.py`). Nothing in
@@ -73,6 +73,7 @@ the library layers knows about YAML.
 | `processing.steps` | `ProcessingStepConfig` | `features/config.py` | `(ProcessingStep, stages)` |
 | `model` | `ModelConfig` | `models/config.py` | `nn.Module` |
 | `optimizer` | `OptimizerConfig` | `cli/config.py` | `torch.optim.Optimizer` |
+| `scheduler` | `SchedulerConfig` | `cli/config.py` | `torch.optim.lr_scheduler.LRScheduler` |
 | `loss` | `LossConfig` | `cli/config.py` | `nn.CrossEntropyLoss` |
 | `training.trackers` | `TrackerConfig` | `tracking/config.py` | `ExperimentTracker` |
 
@@ -98,8 +99,9 @@ RawSourceConfig = Annotated[
   omission says so once, with `default_kind("<kind>")` after the
   discriminator (`model` → `mlp`, `optimizer` → `adamw`, `loss` →
   `cross_entropy`); every other slot (`data.train` / `test`,
-  `data.encodings[]`, `processing.steps[]`, `training.trackers[]`)
-  requires the tag in YAML.
+  `data.encodings[]`, `processing.steps[]`, `scheduler`,
+  `training.trackers[]`) requires the tag in YAML. `scheduler` may also be
+  omitted entirely, which builds no scheduler.
 - Variant fields are typed per variant — `SgdConfig.momentum` does not
   exist for `adam`. "Anything else goes here" means *fields of that
   variant*, each with its own constraints.

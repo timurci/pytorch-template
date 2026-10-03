@@ -9,7 +9,7 @@ uv run template-infer --config configs/example.yaml
 
 | Command | Config sections used | Result |
 | --- | --- | --- |
-| `template-train` | `data`, `processing`, `model`, `optimizer`, `loss`, `training` | `training.checkpoint_path` (`state_dict`) |
+| `template-train` | `data`, `processing`, `model`, `optimizer`, `scheduler`, `loss`, `training` | `training.checkpoint_path` (`state_dict`) |
 | `template-infer` | `data`, `processing`, `model`, `inference`, `training.checkpoint_path` / `training.seed` | `inference.output_path` (`id,<target>`) |
 
 Both commands validate the whole file, so a typo anywhere fails fast. Run
@@ -22,7 +22,9 @@ Both commands validate the whole file, so a typo anywhere fails fast. Run
 - Unknown fields are rejected, so misspelled keys are errors.
 - `kind` may be omitted only where a section declares a default kind
   (`model` → `mlp`, `optimizer` → `adamw`, `loss` → `cross_entropy`);
-  sources, encodings, steps, and trackers require it.
+  sources, encodings, steps, the scheduler, and trackers require it.
+  `scheduler` may also be omitted entirely, which keeps a constant learning
+  rate.
 - Target mapping values must be exactly the model's class indices
   (`0..n_classes-1` for `kind: mlp`).
 
@@ -34,8 +36,9 @@ cp configs/example.yaml.example configs/example.yaml
 ```
 
 Sections are typed; slots that pick an implementation are `kind`-tagged
-unions (sources, encodings, steps, model, optimizer, loss, trackers). A
-section with a default kind may omit the tag; see the bullets above. The
+unions (sources, encodings, steps, model, optimizer, scheduler, loss,
+trackers). A section with a default kind may omit the tag; see the bullets
+above. The
 schema pattern and how to add a `kind`:
 [config-pattern.md](config-pattern.md).
 
@@ -147,6 +150,26 @@ so it is not configurable.
 | `weight_decay` | 0.0 | all kinds |
 | `momentum` | 0.0 | `sgd` only |
 
+### `scheduler`
+
+Optional. Omit the section to keep the optimizer's learning rate constant.
+When present, `kind` is required. The trainer steps the scheduler once
+after each epoch (after validation, when there is a validation loader), so
+`step_size`, `milestones`, and `t_max` count epochs — the same call site as
+PyTorch's own examples. The first epoch runs at the optimizer's `lr`.
+`train/lr` is the first param group's rate during that epoch, logged before
+the step.
+
+`ReduceLROnPlateau` and per-batch schedules (`OneCycleLR`, `CyclicLR`) are
+not kinds: the trainer calls `step()` with no arguments, once per epoch.
+
+| `kind` | Fields | Schedule |
+| --- | --- | --- |
+| `step` | `step_size` (required, > 0), `gamma` (default 0.1, > 0) | `StepLR`: multiply by `gamma` every `step_size` completed epochs |
+| `multistep` | `milestones` (required, strictly increasing ints > 0), `gamma` (default 0.1, > 0) | `MultiStepLR`: multiply by `gamma` when completed epochs hit a milestone |
+| `exponential` | `gamma` (required, > 0) | `ExponentialLR`: multiply by `gamma` every completed epoch |
+| `cosine` | `t_max` (required, > 0), `eta_min` (default 0, ≥ 0) | `CosineAnnealingLR`: anneal from the optimizer lr to `eta_min` over `t_max` epochs |
+
 ### `loss`
 
 | Field | Default | Notes |
@@ -183,7 +206,7 @@ so it is not configurable.
 
 | `kind` | Fields | Output |
 | --- | --- | --- |
-| `stdout` | `every_n_steps` (default `1`, min `1`) | one `params {...}` line, then per-split `loss`, `accuracy`, per-class `precision_<i>` / `recall_<i>` / `f1_<i>`, and `precision_macro` / `recall_macro` / `f1_macro` every `every_n_steps`-th epoch and on the final epoch; adds `train/grad_norm` when `training.track_gradients` is true |
+| `stdout` | `every_n_steps` (default `1`, min `1`) | one `params {...}` line, then per-split `loss`, `accuracy`, per-class `precision_<i>` / `recall_<i>` / `f1_<i>`, and `precision_macro` / `recall_macro` / `f1_macro` every `every_n_steps`-th epoch and on the final epoch; the train split also logs `train/lr` (first param group's rate during that epoch); adds `train/grad_norm` when `training.track_gradients` is true |
 | `null` | — | nothing |
 | `mlflow` | `experiment_name` (default `template`), `run_name`, `tracking_uri` | params and per-epoch metrics in the active run |
 
@@ -241,8 +264,9 @@ saved predictions to outputs/predictions.csv
 4. Build `TableDataset` over the source and `Subset` train/validation
    `DataLoader`s; `input_size` is `schema.feature_width`.
 5. Build the model (`model.build(schema.feature_width)`) on `device`, the
-   optimizer, the loss; the processing
-   pipeline is built from `processing.steps` against the schema.
+   optimizer, the scheduler around that optimizer when `scheduler` is set,
+   and the loss. The processing pipeline is built from `processing.steps`
+   against the schema.
    `loss.class_weights: balanced` resolves inverse-frequency weights from
    the train partition's class counts.
 6. Open the trackers, log the flattened config as params, and run `Trainer`

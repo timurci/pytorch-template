@@ -4,6 +4,7 @@ from typing import NamedTuple
 import torch
 from torch import Tensor, nn
 from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from template.data import Batch
@@ -40,6 +41,16 @@ class Trainer:
     the batch — metrics therefore describe the processed data. Each batch
     gets its own RNG stream seeded from `(seed, stage, epoch, batch)`, so a
     seeded run reproduces exactly.
+
+    An optional `LRScheduler` is stepped once after each epoch (after
+    validation, when there is a validation loader) with no arguments, the
+    same place PyTorch's own examples call `step()`. Its unit is that call:
+    `step_size`, milestones, and `T_max` count epochs. `None` leaves the
+    learning rate constant. The scheduler must wrap this trainer's
+    optimizer. `ReduceLROnPlateau` is rejected — `step` requires a metric —
+    and iteration-level schedules are out of scope for the same reason:
+    this loop has one cadence. Each train epoch logs `train/lr`, the first
+    param group's rate during that epoch, before the scheduler steps.
     """
 
     def __init__(
@@ -47,10 +58,19 @@ class Trainer:
         model: nn.Module,
         optimizer: Optimizer,
         *,
+        scheduler: LRScheduler | None = None,
         device: torch.device | str = "cpu",
     ) -> None:
+        if isinstance(scheduler, ReduceLROnPlateau):
+            raise TypeError(
+                "ReduceLROnPlateau.step() requires a metric; "
+                "Trainer steps a scheduler once per epoch with no arguments"
+            )
+        if scheduler is not None and scheduler.optimizer is not optimizer:
+            raise ValueError("scheduler must wrap the trainer's optimizer")
         self._model = model
         self._optimizer = optimizer
+        self._scheduler = scheduler
         self._device = torch.device(device)
 
     def train(
@@ -84,6 +104,8 @@ class Trainer:
                     epoch=epoch,
                 )
                 self._log_metrics(val_metrics, trackers, step=epoch)
+            if self._scheduler is not None:
+                self._scheduler.step()
 
     def _run_train_epoch(
         self,
@@ -109,6 +131,7 @@ class Trainer:
             track_gradients=track_gradients,
         )
         logged = _metric_entries("train", metrics)
+        logged["train/lr"] = _learning_rate(self._optimizer)
         if metrics.grad_norm is not None:
             logged["train/grad_norm"] = metrics.grad_norm
         return logged
@@ -167,6 +190,11 @@ def _metric_entries(split: str, metrics: _EpochMetrics) -> dict[str, float]:
 
 def _mean(values: tuple[float, ...]) -> float:
     return sum(values) / len(values) if values else 0.0
+
+
+def _learning_rate(optimizer: Optimizer) -> float:
+    """Rate used for this epoch's updates: the first param group."""
+    return float(optimizer.param_groups[0]["lr"])
 
 
 def _run_epoch(

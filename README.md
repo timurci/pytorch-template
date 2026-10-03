@@ -17,7 +17,7 @@ new component (model, source, step, tracker) configurable — is
 | `features` | Feature processing: `ProcessingStep` / `ProcessingPipeline` — tensor-only preprocessing and augmentation in one stage-tagged, seeded machinery |
 | `models` | `nn.Module` architectures (reference: `MLPClassifier`) |
 | `tracking` | `ExperimentTracker` protocol; `null` / `stdout` / `mlflow` adapters |
-| `training` | `Trainer`: the epoch loop; applies the processing pipeline per batch; trackers injected |
+| `training` | `Trainer`: the epoch loop; optional epoch `LRScheduler`; applies the processing pipeline per batch; trackers injected |
 | `cli` | Entrypoints (`template-train` / `template-infer`); the composition-root schema (`cli/config.py`) and wiring |
 
 ## Quickstart

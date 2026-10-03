@@ -87,6 +87,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     processing = config.processing.build(schema)
     model = config.model.build(schema.feature_width).to(device)
     optimizer = config.optimizer.build(model.parameters())
+    scheduler = (
+        config.scheduler.build(optimizer)
+        if config.scheduler is not None
+        else None
+    )
     loss_fn = config.loss.build(train_counts).to(device)
 
     rows = (
@@ -107,7 +112,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             ]
         for tracker in trackers:
             tracker.log_params(params)
-        Trainer(model, optimizer, device=device).train(
+        Trainer(model, optimizer, scheduler=scheduler, device=device).train(
             train_loader,
             val_loader,
             epochs=config.training.epochs,
