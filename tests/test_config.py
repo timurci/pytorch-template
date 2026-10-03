@@ -4,13 +4,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 from pydantic import ValidationError
+from torch import nn
+from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 
 from template.cli.config import (
     AdamWConfig,
+    CosineAnnealingLRConfig,
     CrossEntropyLossConfig,
     DataConfig,
     ExperimentConfig,
+    StepLRConfig,
     load_config,
 )
 from template.models.config import MLPModelConfig
@@ -106,6 +111,7 @@ def test_kind_may_be_omitted_where_the_slot_declares_a_default() -> None:
             {"training": {"checkpoint_path": "m.pt", "trackers": [{}]}},
             id="tracker",
         ),
+        pytest.param({"scheduler": {"step_size": 1}}, id="scheduler"),
     ],
 )
 def test_kind_is_required_where_the_slot_has_no_default(
@@ -113,6 +119,39 @@ def test_kind_is_required_where_the_slot_has_no_default(
 ) -> None:
     with pytest.raises(ValidationError):
         ExperimentConfig.model_validate(_experiment(**sections))
+
+
+def test_scheduler_is_optional() -> None:
+    config = ExperimentConfig.model_validate(_experiment())
+    assert config.scheduler is None
+
+
+def test_scheduler_kind_builds_the_torch_scheduler() -> None:
+    step = ExperimentConfig.model_validate(
+        _experiment(scheduler={"kind": "step", "step_size": 2, "gamma": 0.5})
+    )
+    cosine = ExperimentConfig.model_validate(
+        _experiment(scheduler={"kind": "cosine", "t_max": 10})
+    )
+    assert isinstance(step.scheduler, StepLRConfig)
+    assert isinstance(cosine.scheduler, CosineAnnealingLRConfig)
+    model = nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    built_step = step.scheduler.build(optimizer)
+    built_cosine = cosine.scheduler.build(optimizer)
+    assert isinstance(built_step, StepLR)
+    assert built_step.step_size == 2
+    assert built_step.gamma == 0.5
+    assert isinstance(built_cosine, CosineAnnealingLR)
+    assert built_cosine.T_max == 10
+    assert built_cosine.eta_min == 0.0
+
+
+def test_multistep_milestones_must_be_strictly_increasing() -> None:
+    with pytest.raises(ValidationError, match="strictly increasing"):
+        ExperimentConfig.model_validate(
+            _experiment(scheduler={"kind": "multistep", "milestones": [4, 2]})
+        )
 
 
 def test_target_mapping_must_match_the_model_head() -> None:

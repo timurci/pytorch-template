@@ -1,17 +1,17 @@
 """Pydantic schema for the shared YAML experiment config and its loader.
 
 One config file describes the whole experiment: data sources and column
-roles, feature processing, model architecture, optimizer/loss, training
-loop, and inference output. `template-train` and `template-infer` validate
-the same file and each use their own sections.
+roles, feature processing, model architecture, optimizer/scheduler/loss,
+training loop, and inference output. `template-train` and `template-infer`
+validate the same file and each use their own sections.
 
 This module is the composition root's own schema: `ExperimentConfig`
 assembles the layers' config schemas (`template.<layer>.config` — each
 lives with the class it builds) and adds the sections no library layer
-owns (which sources feed the run, optimizer/loss over `torch` objects,
-`training`, `inference`) plus the cross-object invariants. The entrypoints
-do the wiring: they call each schema's `build()` and pass plain objects
-between the layers. Loading is `load_config` — the only place the file is
+owns (which sources feed the run, optimizer/scheduler/loss over `torch`
+objects, `training`, `inference`) plus the cross-object invariants. The
+entrypoints do the wiring: they call each schema's `build()` and pass plain
+objects between the layers. Loading is `load_config` — the only place the file is
 read. The pattern and its extension recipes: docs/config-pattern.md.
 """
 
@@ -25,6 +25,13 @@ from pydantic import Field, model_validator
 from torch import Tensor, nn
 from torch.nn import Parameter
 from torch.optim import SGD, Adam, AdamW, Optimizer
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    ExponentialLR,
+    LRScheduler,
+    MultiStepLR,
+    StepLR,
+)
 
 from template.config_pattern import ConfigModel, default_kind
 from template.data import TableSchema
@@ -121,6 +128,63 @@ OptimizerConfig = Annotated[
 ]
 
 
+class StepLRConfig(ConfigModel):
+    kind: Literal["step"] = "step"
+    step_size: int = Field(gt=0)
+    gamma: float = Field(default=0.1, gt=0)
+
+    def build(self, optimizer: Optimizer) -> LRScheduler:
+        return StepLR(optimizer, step_size=self.step_size, gamma=self.gamma)
+
+
+class MultiStepLRConfig(ConfigModel):
+    kind: Literal["multistep"] = "multistep"
+    milestones: list[Annotated[int, Field(gt=0)]] = Field(min_length=1)
+    gamma: float = Field(default=0.1, gt=0)
+
+    @model_validator(mode="after")
+    def _milestones_increase(self) -> Self:
+        if list(self.milestones) != sorted(set(self.milestones)):
+            raise ValueError(
+                "milestones must be strictly increasing, "
+                f"got {list(self.milestones)}"
+            )
+        return self
+
+    def build(self, optimizer: Optimizer) -> LRScheduler:
+        return MultiStepLR(
+            optimizer, milestones=self.milestones, gamma=self.gamma
+        )
+
+
+class ExponentialLRConfig(ConfigModel):
+    kind: Literal["exponential"] = "exponential"
+    gamma: float = Field(gt=0)
+
+    def build(self, optimizer: Optimizer) -> LRScheduler:
+        return ExponentialLR(optimizer, gamma=self.gamma)
+
+
+class CosineAnnealingLRConfig(ConfigModel):
+    kind: Literal["cosine"] = "cosine"
+    t_max: int = Field(gt=0)
+    eta_min: float = Field(default=0.0, ge=0)
+
+    def build(self, optimizer: Optimizer) -> LRScheduler:
+        return CosineAnnealingLR(
+            optimizer, T_max=self.t_max, eta_min=self.eta_min
+        )
+
+
+SchedulerConfig = Annotated[
+    StepLRConfig
+    | MultiStepLRConfig
+    | ExponentialLRConfig
+    | CosineAnnealingLRConfig,
+    Field(discriminator="kind"),
+]
+
+
 class CrossEntropyLossConfig(ConfigModel):
     kind: Literal["cross_entropy"] = "cross_entropy"
     class_weights: Literal["balanced"] | None = None
@@ -186,6 +250,7 @@ class ExperimentConfig(ConfigModel):
     processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
     model: ModelConfig
     optimizer: OptimizerConfig = Field(default_factory=AdamWConfig)
+    scheduler: SchedulerConfig | None = None
     loss: LossConfig = Field(default_factory=CrossEntropyLossConfig)
     training: TrainingConfig
     inference: InferenceConfig = Field(default_factory=InferenceConfig)

@@ -3,8 +3,10 @@
 import math
 from collections.abc import Mapping
 
+import pytest
 import torch
 from torch import Tensor, nn
+from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 from torch.utils.data import DataLoader, Dataset
 
 from template.data import Batch
@@ -111,3 +113,55 @@ def test_validation_runs_eval_tagged_steps() -> None:
     # 64 rows / batch 16: four train batches and four validation batches.
     assert train_step.calls == 4
     assert eval_step.calls == 4
+
+
+def test_without_scheduler_learning_rate_stays_constant() -> None:
+    model = MLPClassifier(8, hidden_size=16, hidden_depth=1, n_classes=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    tracker = _RecordingTracker()
+    Trainer(model, optimizer).train(
+        _loader(),
+        epochs=2,
+        loss_fn=nn.CrossEntropyLoss(),
+        trackers=[tracker],
+    )
+    assert tracker.metrics[0]["train/lr"] == pytest.approx(0.01)
+    assert tracker.metrics[1]["train/lr"] == pytest.approx(0.01)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.01)
+
+
+def test_scheduler_steps_once_per_epoch_after_validation() -> None:
+    model = MLPClassifier(8, hidden_size=16, hidden_depth=1, n_classes=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = StepLR(optimizer, step_size=1, gamma=0.1)
+    tracker = _RecordingTracker()
+    Trainer(model, optimizer, scheduler=scheduler).train(
+        _loader(),
+        _loader(),
+        epochs=2,
+        loss_fn=nn.CrossEntropyLoss(),
+        trackers=[tracker],
+    )
+    # Train metrics are interleaved with validation: the logged rate is the
+    # one used for that epoch's updates, and validation does not step again.
+    assert tracker.metrics[0]["train/lr"] == pytest.approx(0.1)
+    assert "train/lr" not in tracker.metrics[1]
+    assert tracker.metrics[2]["train/lr"] == pytest.approx(0.01)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.001)
+
+
+def test_plateau_scheduler_is_rejected() -> None:
+    model = MLPClassifier(8, hidden_size=16, hidden_depth=1, n_classes=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = ReduceLROnPlateau(optimizer)
+    with pytest.raises(TypeError, match="ReduceLROnPlateau"):
+        Trainer(model, optimizer, scheduler=scheduler)
+
+
+def test_scheduler_must_wrap_the_trainers_optimizer() -> None:
+    model = MLPClassifier(8, hidden_size=16, hidden_depth=1, n_classes=2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    other = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = StepLR(other, step_size=1)
+    with pytest.raises(ValueError, match="wrap the trainer's optimizer"):
+        Trainer(model, optimizer, scheduler=scheduler)
