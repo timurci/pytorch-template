@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from template.cli.config import load_config
+from template.cli.config import ExperimentConfig, load_config
 from template.cli.runtime import (
     configure_logging,
     flatten_params,
@@ -21,8 +21,14 @@ from template.data import (
     class_counts,
     partition_indices,
 )
-from template.persistence import save_checkpoint
-from template.training import Trainer
+from template.training import (
+    CheckpointStrategy,
+    Trainer,
+    load_best_score,
+    load_training_state,
+    restore_training_state,
+)
+from template.training.config import BestCheckpointConfig, RecoveryCheckpointConfig
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +99,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         else None
     )
     loss_fn = config.loss.build(train_counts).to(device)
+    start_epoch = 0
+    best_score = None
+    if args.resume:
+        start_epoch = _resume(config, model, optimizer, scheduler)
+        best = config.training.best()
+        if best is not None and best.path.is_file():
+            best_score = load_best_score(best.path)
+    checkpoints = _build_checkpoints(config, score=best_score)
 
     rows = (
         f"{len(train_subset)}+{len(val_subset)}"
@@ -116,15 +130,52 @@ def main(argv: Sequence[str] | None = None) -> None:
             train_loader,
             val_loader,
             epochs=config.training.epochs,
+            start_epoch=start_epoch,
             loss_fn=loss_fn,
             trackers=trackers,
+            checkpoints=checkpoints,
             processing=processing,
             seed=config.training.seed,
             track_gradients=config.training.track_gradients,
         )
 
-    save_checkpoint(model.state_dict(), config.training.checkpoint_path)
-    logger.info("saved checkpoint to %s", config.training.checkpoint_path)
+
+def _resume(
+    config: ExperimentConfig,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+) -> int:
+    path = config.training.recovery().path
+    if not path.is_file():
+        raise FileNotFoundError(f"recovery checkpoint not found at {path}")
+    start_epoch = restore_training_state(
+        load_training_state(path),
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+    if start_epoch > config.training.epochs:
+        raise ValueError(
+            "recovery checkpoint completed epoch "
+            f"{start_epoch - 1}, past training.epochs "
+            f"({config.training.epochs})"
+        )
+    logger.info("resuming at epoch %s", start_epoch)
+    return start_epoch
+
+
+def _build_checkpoints(
+    config: ExperimentConfig, *, score: float | None
+) -> list[CheckpointStrategy]:
+    built: list[CheckpointStrategy] = []
+    for item in config.training.checkpoints:
+        match item:
+            case RecoveryCheckpointConfig():
+                built.append(item.build(epochs=config.training.epochs))
+            case BestCheckpointConfig():
+                built.append(item.build(score=score))
+    return built
 
 
 def _log_class_distribution(name: str, counts: Mapping[int, int]) -> None:
@@ -150,6 +201,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         required=True,
         help="path to the experiment YAML config",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue from the recovery checkpoint",
     )
     return parser.parse_args(argv)
 

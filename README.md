@@ -17,7 +17,7 @@ new component (model, source, step, tracker) configurable — is
 | `features` | Feature processing: `ProcessingStep` / `ProcessingPipeline` — tensor-only preprocessing and augmentation in one stage-tagged, seeded machinery |
 | `models` | `nn.Module` architectures (reference: `MLPClassifier`) |
 | `tracking` | `ExperimentTracker` protocol; `null` / `stdout` / `mlflow` adapters |
-| `training` | `Trainer`: the epoch loop; optional epoch `LRScheduler`; applies the processing pipeline per batch; trackers injected |
+| `training` | `Trainer`: the epoch loop; optional epoch `LRScheduler`; applies the processing pipeline per batch; trackers and checkpoint strategies injected |
 | `cli` | Entrypoints (`template-train` / `template-infer`); the composition-root schema (`cli/config.py`) and wiring |
 
 ## Quickstart
@@ -29,9 +29,10 @@ uv run template-train --config configs/example.yaml
 uv run template-infer --config configs/example.yaml
 ```
 
-Training saves `training.checkpoint_path`; inference writes
-`inference.output_path` (`id,<target>` with class-1 probabilities). Full
-field reference: [docs/cli.md](docs/cli.md).
+Training writes the recovery checkpoint and, when configured, the best
+checkpoint. Inference loads the best file when it exists, otherwise the
+recovery file, and writes `inference.output_path` (`id,<target>` with
+class-1 probabilities). Full field reference: [docs/cli.md](docs/cli.md).
 
 ## Using it as a template
 

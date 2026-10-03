@@ -46,7 +46,11 @@ def _experiment(**sections: Any) -> dict[str, Any]:
     raw: dict[str, Any] = {
         "data": _data(),
         "model": {"kind": "mlp"},
-        "training": {"checkpoint_path": "outputs/model.pt"},
+        "training": {
+            "checkpoints": [
+                {"kind": "recovery", "path": "outputs/recovery.pt"},
+            ]
+        },
     }
     raw.update(sections)
     return raw
@@ -108,8 +112,17 @@ def test_kind_may_be_omitted_where_the_slot_declares_a_default() -> None:
             id="step",
         ),
         pytest.param(
-            {"training": {"checkpoint_path": "m.pt", "trackers": [{}]}},
+            {
+                "training": {
+                    "checkpoints": [{"kind": "recovery", "path": "m.pt"}],
+                    "trackers": [{}],
+                }
+            },
             id="tracker",
+        ),
+        pytest.param(
+            {"training": {"checkpoints": [{"path": "m.pt"}]}},
+            id="checkpoint",
         ),
         pytest.param({"scheduler": {"step_size": 1}}, id="scheduler"),
     ],

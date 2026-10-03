@@ -4,13 +4,14 @@ Two console scripts, both driven by one YAML experiment config:
 
 ```bash
 uv run template-train --config configs/example.yaml
+uv run template-train --config configs/example.yaml --resume
 uv run template-infer --config configs/example.yaml
 ```
 
 | Command | Config sections used | Result |
 | --- | --- | --- |
-| `template-train` | `data`, `processing`, `model`, `optimizer`, `scheduler`, `loss`, `training` | `training.checkpoint_path` (`state_dict`) |
-| `template-infer` | `data`, `processing`, `model`, `inference`, `training.checkpoint_path` / `training.seed` | `inference.output_path` (`id,<target>`) |
+| `template-train` | `data`, `processing`, `model`, `optimizer`, `scheduler`, `loss`, `training` | recovery checkpoint, and a best checkpoint when configured |
+| `template-infer` | `data`, `processing`, `model`, `inference`, `training.checkpoints` / `training.seed` | `inference.output_path` (`id,<target>`) |
 
 Both commands validate the whole file, so a typo anywhere fails fast. Run
 `uv run template-train --help` for the flags.
@@ -22,7 +23,8 @@ Both commands validate the whole file, so a typo anywhere fails fast. Run
 - Unknown fields are rejected, so misspelled keys are errors.
 - `kind` may be omitted only where a section declares a default kind
   (`model` → `mlp`, `optimizer` → `adamw`, `loss` → `cross_entropy`);
-  sources, encodings, steps, the scheduler, and trackers require it.
+  sources, encodings, steps, the scheduler, trackers, and checkpoint
+  entries require it.
   `scheduler` may also be omitted entirely, which keeps a constant learning
   rate.
 - Target mapping values must be exactly the model's class indices
@@ -189,7 +191,7 @@ not kinds: the trainer calls `step()` with no arguments, once per epoch.
 | `device` | `auto` | `auto` picks CUDA, then MPS, then CPU; or force `cpu` / `cuda` / `mps` |
 | `trackers` | `[{kind: stdout}]` | see below |
 | `track_gradients` | false | log `train/grad_norm`, the mean over batches of the total parameter gradient L2 norm, measured after backward and before the optimizer step |
-| `checkpoint_path` | required | `state_dict` saved here when training ends |
+| `checkpoints` | required | one `recovery` entry and at most one `best` entry; see below |
 
 ### `inference`
 
@@ -199,6 +201,30 @@ not kinds: the trainer calls `step()` with no arguments, once per epoch.
 | `save` | true | write `output_path` |
 | `report` | true | print row count and probability summary |
 | `output_path` | `outputs/predictions.csv` | `id,<target column>` |
+
+## Checkpoints
+
+`training.checkpoints` is a list. Exactly one entry has `kind: recovery`.
+At most one has `kind: best`. `kind` is required on each entry.
+
+| `kind` | Fields | What is written |
+| --- | --- | --- |
+| `recovery` | `path` (required); `every` (optional, integer > 0) | the training state: completed `epoch`, model weights, optimizer state, and scheduler state or `null`. Written when the count of completed epochs is a multiple of `every`, and always on the final epoch. Omit `every` and only the final epoch is written |
+| `best` | `path` (required) | completed `epoch`, model weights, and the `score`. Considered every epoch. The score is `val/loss` when validation ran, otherwise `train/loss`. Lower wins. An equal score keeps the earlier file |
+
+Both files are mappings, not a bare `state_dict`. A strategy writes during
+the epoch, after validation and after the scheduler step. Paths create
+parent directories. A write replaces the file atomically.
+
+`template-train --resume` loads the recovery file into the model, optimizer,
+and scheduler built from the config, seeds the best strategy from the best
+file's score when that file exists, and continues at `epoch + 1`. `epochs`
+stays the original total. Without `--resume`, files already on disk are
+ignored. Resuming does not repeat the training loader's shuffle order.
+
+`template-infer` loads model weights from the best file when that entry
+exists and the file is present, otherwise from the recovery file. The
+config must describe the same model the checkpoint was trained with.
 
 ## Trackers and logging
 
@@ -229,8 +255,12 @@ device=cpu rows=1200+134 epochs=10
 params {'data.train.kind': 'csv', ..., 'processing.steps': '[...]', ...}
 step=0 metrics {'train/loss': 0.2421, 'train/accuracy': 0.8897, ...}
 step=0 metrics {'val/loss': 0.2379, 'val/accuracy': 0.8925, ...}
-saved checkpoint to outputs/model.pt
+saved checkpoint to outputs/best.pt
 ```
+
+The best file is written on the first epoch and again whenever the score
+improves. The recovery file is written on its interval and on the final
+epoch, as `saved checkpoint to outputs/recovery.pt`.
 
 `features: ...` is the resolved feature set and width — logged on purpose, so
 a stray or leaky column surfaces here (and in the tracked params) instead of
@@ -268,11 +298,15 @@ saved predictions to outputs/predictions.csv
    and the loss. The processing pipeline is built from `processing.steps`
    against the schema.
    `loss.class_weights: balanced` resolves inverse-frequency weights from
-   the train partition's class counts.
+   the train partition's class counts. With `--resume`, load the recovery
+   checkpoint into the model, optimizer, and scheduler, and continue at the
+   saved epoch plus one. The best strategy is seeded from the best file's
+   score when that file exists.
 6. Open the trackers, log the flattened config as params, and run `Trainer`
-   for `epochs` with `processing=...` and `seed=...` (batches are processed
-   per stage: `train` for training, `eval` for validation).
-7. `save_checkpoint(model.state_dict(), checkpoint_path)`.
+   for `range(start_epoch, epochs)` with the checkpoint strategies,
+   `processing=...`, and `seed=...` (batches are processed per stage:
+   `train` for training, `eval` for validation). Strategies write during
+   the loop.
 
 `template-infer`:
 
@@ -281,8 +315,10 @@ saved predictions to outputs/predictions.csv
    `include_target=False` (the target is excluded when present, absent
    otherwise). Ids are read through the validated source as metadata: they
    ride through ingestion untouched and row order is preserved.
-2. Rebuild the model from the same config, `load_state_dict`, `eval()` on
-   CPU; build the processing pipeline from the same `processing.steps`.
+2. Rebuild the model from the same config, load weights from the best
+   checkpoint when that file exists and otherwise from the recovery
+   checkpoint, `eval()` on CPU; build the processing pipeline from the same
+   `processing.steps`.
 3. Per batch: `processing.process(batch, stage="predict", rng=...)` (the
    generator is seeded from `training.seed`), then
    `softmax(logits, dim=1)[:, 1]`.
@@ -290,8 +326,10 @@ saved predictions to outputs/predictions.csv
 
 ## Artifacts
 
-- `training.checkpoint_path` is a plain `torch` `state_dict` with no
-  architecture inside, so the inference config must describe the same model.
+- The recovery checkpoint holds the training state (epoch, model weights,
+  optimizer state, scheduler state). The best checkpoint holds the epoch,
+  the model weights, and the score. Neither file stores the architecture,
+  so the inference config must describe the same model.
 - `inference.output_path` is a CSV with the configured id column and the target
   column, holding probabilities of class `1` in `[0, 1]`.
 - Both paths create parent directories automatically.

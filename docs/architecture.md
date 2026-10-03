@@ -36,7 +36,7 @@ serves.
 | `features` | Feature processing | `ProcessingStep` protocol + `ProcessingPipeline` (ordered, stage-tagged steps over batches); `ScaleByCap`, `LogScaleByCap`, `GaussianNoise`, and their `config.py` schemas | File I/O; raw forms or column names in steps (config declares names, resolved at build); fitting state from data |
 | `models` | Network definitions | `nn.Module` subclasses, e.g. `MLPClassifier`; `models/config.py` schemas | Anything but `torch` (its `config.py` may add `pydantic`) |
 | `tracking` | Observability port | `ExperimentTracker` protocol; `Null` / `Stdout` / `MLflow` adapters, and their `config.py` schemas | Owning external lifecycles (the CLI opens/closes the MLflow run) |
-| `training` | The training loop | `Trainer` | Touching sources or splitting data, building models/loaders/schedulers, checkpointing, opening tracker runs |
+| `training` | The training loop and checkpoint strategies | `Trainer`, `CheckpointStrategy`, the recovery and best strategies, and their `config.py` schemas | Touching sources or splitting data, building models/loaders/schedulers, choosing checkpoint paths, resuming a run, opening tracker runs |
 | `cli` | Entrypoints / composition root | The composition-root schema (`cli/config.py`: `ExperimentConfig`, `DataConfig`, `TrainingConfig` / `InferenceConfig`, optimizer/scheduler/loss schemas) and the `build()` wiring, `template-train`, `template-infer` | Contain business logic — it only wires layers |
 
 ## Dependency rules
@@ -66,8 +66,11 @@ The allowed edges, exactly:
   (`features/protocol.py`), structurally satisfied by `data.TableSchema`,
   so config adds no import edge.
 - `training` → `data.Batch`, `features.ProcessingPipeline` /
-  `features.Stage`, `tracking.ExperimentTracker`, plus `torch`'s own
-  `nn.Module`, `Optimizer`, `LRScheduler`, and `DataLoader`.
+  `features.Stage`, `tracking.ExperimentTracker`,
+  `persistence.save_checkpoint` / `load_checkpoint`, plus `torch`'s own
+  `nn.Module`, `Optimizer`, `LRScheduler`, and `DataLoader`. Persistence
+  still stores a caller-supplied mapping; the training layer owns the
+  checkpoint record.
 - `persistence` and `data` import nothing from sibling layers at all: raw
   readers are plain classes whose methods (`columns`, `count`,
   `read(indices) -> pl.DataFrame`) satisfy `data.RawTableSource`
@@ -76,8 +79,10 @@ The allowed edges, exactly:
 - `models` and `tracking` import nothing from sibling layers.
 
 Everything else (constructing the model, the optimizer, the scheduler, the
-loaders, the trackers, the processing pipeline, saving checkpoints) happens
-in the entrypoint and is passed in.
+loaders, the trackers, the processing pipeline, resuming from a checkpoint,
+and choosing which file inference loads) happens in the entrypoint and is
+passed in. Checkpoint strategies, passed into the trainer, decide when to
+write.
 
 ## The batch contract
 
@@ -301,12 +306,25 @@ schedules (`OneCycleLR`, `CyclicLR`) are out of scope for the same reason
 — the loop has one cadence, the epoch. Each train epoch logs `train/lr`,
 the first param group's rate during that epoch, before the scheduler steps.
 
+Checkpoint strategies are called once that step has finished. Each receives
+the same training state — the completed epoch, the model weights, the
+optimizer state, and the scheduler state or none — and, separately, that
+epoch's metrics. Metrics are not part of the training state: a resumed run
+does not restore them. `Trainer.state` is the record from the last completed
+epoch and raises before one exists. `train(..., start_epoch=)` continues at
+that index; `epochs` stays the original total, so the loop is
+`range(start_epoch, epochs)`. The shipped strategies are recovery (the whole
+training state, every N completed epochs and always the final epoch) and
+best (the lowest `val/loss`, or `train/loss` when validation did not run).
+
 Explicit non-responsibilities, all handled by the caller:
 
 - no train/val splitting (`partition_indices` + `Subset` do it),
 - no data access (it sees `DataLoader[Batch]`, never a source),
 - no model/optimizer/scheduler/loss/loader construction,
-- no checkpointing (persistence functions, called by the CLI),
+- no opening checkpoint files and no choice of paths (strategies write to
+  paths they were given; the CLI loads a recovery record and passes
+  `start_epoch`),
 - no tracker lifecycle management.
 
 The shipped loop is the *classification* specialization: it expects logits
@@ -336,7 +354,8 @@ inference output. The pattern (normative detail and extension recipes:
   feature-tensor blocks when the processing pipeline is built, so
   processing steps stay tensor-only.
 - Polymorphic slots (sources, encodings, processing steps, models,
-  optimizers, schedulers, losses, trackers) use a `kind` discriminator:
+  optimizers, schedulers, losses, trackers, checkpoints) use a `kind`
+  discriminator:
   adding an implementation = new class in its layer + new `*Config` schema
   added to the union. The slot's union is its type from day one, even with
   a single member.
@@ -364,15 +383,17 @@ logs and tracked params instead of inside the model) → `ValidatedSource` →
 `partition_indices` → `TableDataset` + `Subset` loaders →
 `config.model.build(schema.feature_width)` on device → optimizer, then the
 scheduler around that optimizer when configured → open trackers, log
-flattened config as params → `Trainer.train(processing=…, seed=…)` →
-`save_checkpoint`.
+flattened config as params → optionally `restore_training_state` from the
+recovery checkpoint when `--resume` is set → `Trainer.train(processing=…,
+seed=…, start_epoch=…, checkpoints=…)`.
 
 `template-infer`: `config.data.test.build()` → schema built with
 `include_target=False` (target dropped when present, absent otherwise) →
 ids read through the validated source (metadata rides through untouched,
-row order preserved) → model rebuilt from the same config, `state_dict`
-loaded, `eval()` → per batch: processing at stage `predict`, then
-`softmax(logits, dim=1)[:, 1]` → report/save `id,<target>`.
+row order preserved) → model rebuilt from the same config, weights loaded
+from the best checkpoint when that file exists and otherwise from the
+recovery checkpoint, `eval()` → per batch: processing at stage `predict`,
+then `softmax(logits, dim=1)[:, 1]` → report/save `id,<target>`.
 
 A backend API entrypoint would do the same wiring inside request handlers
 instead of `argparse` mains; nothing in the library changes.
