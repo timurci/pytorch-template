@@ -191,7 +191,7 @@ not kinds: the trainer calls `step()` with no arguments, once per epoch.
 | `device` | `auto` | `auto` picks CUDA, then MPS, then CPU; or force `cpu` / `cuda` / `mps` |
 | `trackers` | `[{kind: stdout}]` | see below |
 | `track_gradients` | false | log `train/grad_norm`, the mean over batches of the total parameter gradient L2 norm, measured after backward and before the optimizer step |
-| `checkpoints` | required | one `recovery` entry and at most one `best` entry; see below |
+| `checkpoints` | required | one `recovery` entry and at most one `best` entry, on different paths; see below |
 
 ### `inference`
 
@@ -205,7 +205,9 @@ not kinds: the trainer calls `step()` with no arguments, once per epoch.
 ## Checkpoints
 
 `training.checkpoints` is a list. Exactly one entry has `kind: recovery`.
-At most one has `kind: best`. `kind` is required on each entry.
+At most one has `kind: best`. The two paths must resolve to different files,
+so one write cannot replace the other's record. `kind` is required on each
+entry.
 
 | `kind` | Fields | What is written |
 | --- | --- | --- |
