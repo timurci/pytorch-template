@@ -76,6 +76,7 @@ the library layers knows about YAML.
 | `scheduler` | `SchedulerConfig` | `cli/config.py` | `torch.optim.lr_scheduler.LRScheduler` |
 | `loss` | `LossConfig` | `cli/config.py` | `nn.CrossEntropyLoss` |
 | `training.trackers` | `TrackerConfig` | `tracking/config.py` | `ExperimentTracker` |
+| `training.checkpoints` | `CheckpointConfig` | `training/config.py` | `RecoveryCheckpoint` / `BestCheckpoint` |
 
 ## Discriminated unions: types YAML can tell apart
 
@@ -100,7 +101,8 @@ RawSourceConfig = Annotated[
   discriminator (`model` → `mlp`, `optimizer` → `adamw`, `loss` →
   `cross_entropy`); every other slot (`data.train` / `test`,
   `data.encodings[]`, `processing.steps[]`, `scheduler`,
-  `training.trackers[]`) requires the tag in YAML. `scheduler` may also be
+  `training.trackers[]`, `training.checkpoints[]`) requires the tag in YAML.
+  `scheduler` may also be
   omitted entirely, which builds no scheduler.
 - Variant fields are typed per variant — `SgdConfig.momentum` does not
   exist for `adam`. "Anything else goes here" means *fields of that
@@ -194,9 +196,9 @@ they do not change. Notes that come with the territory:
   changes with it. The *training loop* is task-specialized; a
   non-classification task also rewrites `training/trainer.py` (see
   [architecture.md](architecture.md#training)).
-- `training.checkpoint_path` stores a bare `state_dict`, so the inference
-  config must describe the same model. One shared file guarantees that by
-  construction.
+- Checkpoints store weights, not the architecture, so inference loads
+  them with the model built from the same config. One shared file
+  guarantees that by construction.
 
 ## Recipe: a new data source kind
 

@@ -40,6 +40,11 @@ from template.features.config import ProcessingConfig
 from template.models.config import MLPModelConfig, ModelConfig
 from template.persistence.config import RawSourceConfig
 from template.tracking.config import StdoutTrackerConfig, TrackerConfig
+from template.training.config import (
+    BestCheckpointConfig,
+    CheckpointConfig,
+    RecoveryCheckpointConfig,
+)
 
 
 class DataConfig(ConfigModel):
@@ -235,7 +240,38 @@ class TrainingConfig(ConfigModel):
     device: str = "auto"
     trackers: list[TrackerConfig] = Field(default_factory=_default_trackers)
     track_gradients: bool = False
-    checkpoint_path: Path
+    checkpoints: list[CheckpointConfig]
+
+    @model_validator(mode="after")
+    def _one_recovery_at_most_one_best(self) -> Self:
+        recoveries = sum(
+            isinstance(item, RecoveryCheckpointConfig)
+            for item in self.checkpoints
+        )
+        bests = sum(
+            isinstance(item, BestCheckpointConfig) for item in self.checkpoints
+        )
+        if recoveries != 1:
+            raise ValueError(
+                "training.checkpoints requires exactly one recovery entry"
+            )
+        if bests > 1:
+            raise ValueError(
+                "training.checkpoints allows at most one best entry"
+            )
+        return self
+
+    def recovery(self) -> RecoveryCheckpointConfig:
+        for item in self.checkpoints:
+            if isinstance(item, RecoveryCheckpointConfig):
+                return item
+        raise RuntimeError("recovery checkpoint is required")
+
+    def best(self) -> BestCheckpointConfig | None:
+        for item in self.checkpoints:
+            if isinstance(item, BestCheckpointConfig):
+                return item
+        return None
 
 
 class InferenceConfig(ConfigModel):

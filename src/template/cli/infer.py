@@ -12,7 +12,8 @@ from torch.utils.data import DataLoader
 from template.cli.config import load_config
 from template.cli.runtime import configure_logging
 from template.data import TableDataset, ValidatedSource
-from template.persistence import load_checkpoint, save_table
+from template.persistence import save_table
+from template.training import inference_checkpoint, load_model_weights
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,13 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     dataset = TableDataset(source)
     model = config.model.build(schema.feature_width)
-    model.load_state_dict(load_checkpoint(config.training.checkpoint_path))
+    best = config.training.best()
+    checkpoint = inference_checkpoint(
+        config.training.recovery().path,
+        None if best is None else best.path,
+    )
+    model.load_state_dict(load_model_weights(checkpoint))
+    logger.info("loaded checkpoint from %s", checkpoint)
     model.eval()
 
     loader = DataLoader(

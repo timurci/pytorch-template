@@ -111,7 +111,15 @@ training:
     #   run_name: baseline
     #   tracking_uri: http://localhost:5000
   # track_gradients: false # log train/grad_norm (mean per-batch total L2 norm)
-  checkpoint_path: outputs/model.pt
+  # Exactly one recovery entry. `every` also keeps every Nth completed
+  # epoch; omit it to keep only the final epoch. At most one best entry,
+  # kept on the lowest val/loss (train/loss when validation is off).
+  checkpoints:
+    - kind: recovery
+      path: outputs/recovery.pt
+      # every: 5
+    - kind: best
+      path: outputs/best.pt
 
 inference:
   batch_size: 8192

@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from template.data import Batch
 from template.features import ProcessingPipeline, Stage
 from template.tracking.protocol import ExperimentTracker
+from template.training.checkpoint import CheckpointStrategy, TrainerState
 
 
 class _ClassMetrics(NamedTuple):
@@ -26,7 +27,7 @@ class _EpochMetrics(NamedTuple):
 
 
 class Trainer:
-    """Runs train/val epochs and fans metrics out to trackers.
+    """Runs train/val epochs, fans metrics out, and notifies checkpoint strategies.
 
     The model must already live on `device`; the trainer only moves batches.
     It is expected to return per-class logits `(N, C)`, used for the loss and
@@ -51,6 +52,13 @@ class Trainer:
     and iteration-level schedules are out of scope for the same reason:
     this loop has one cadence. Each train epoch logs `train/lr`, the first
     param group's rate during that epoch, before the scheduler steps.
+
+    Checkpoint strategies run after that step. Each receives the same
+    training state — the completed epoch, model weights, optimizer state,
+    and scheduler state — plus the epoch's metrics. `state` is that record
+    after the first completed epoch and raises before one exists. Tensor
+    values alias the live module and optimizer. `start_epoch` continues a
+    run at that index; `epochs` stays the original total.
     """
 
     def __init__(
@@ -72,6 +80,20 @@ class Trainer:
         self._optimizer = optimizer
         self._scheduler = scheduler
         self._device = torch.device(device)
+        self._state: TrainerState | None = None
+
+    @property
+    def state(self) -> TrainerState:
+        """Training state captured at the end of the last completed epoch.
+
+        Tensor values alias the live parameters and optimizer buffers. The
+        record is replaced when the next epoch completes.
+        """
+        if self._state is None:
+            raise RuntimeError(
+                "training state is available after an epoch completes"
+            )
+        return self._state
 
     def train(
         self,
@@ -79,13 +101,20 @@ class Trainer:
         val_loader: DataLoader[Batch] | None = None,
         *,
         epochs: int,
+        start_epoch: int = 0,
         loss_fn: Callable[[Tensor, Tensor], Tensor],
         trackers: Sequence[ExperimentTracker] = (),
+        checkpoints: Sequence[CheckpointStrategy] = (),
         processing: ProcessingPipeline | None = None,
         seed: int = 0,
         track_gradients: bool = False,
     ) -> None:
-        for epoch in range(epochs):
+        if not 0 <= start_epoch <= epochs:
+            raise ValueError(
+                "start_epoch must be in 0..epochs, "
+                f"got {start_epoch} for {epochs} epochs"
+            )
+        for epoch in range(start_epoch, epochs):
             train_metrics = self._run_train_epoch(
                 train_loader,
                 loss_fn,
@@ -95,6 +124,7 @@ class Trainer:
                 track_gradients=track_gradients,
             )
             self._log_metrics(train_metrics, trackers, step=epoch)
+            metrics = dict(train_metrics)
             if val_loader is not None:
                 val_metrics = self._run_val_epoch(
                     val_loader,
@@ -104,8 +134,25 @@ class Trainer:
                     epoch=epoch,
                 )
                 self._log_metrics(val_metrics, trackers, step=epoch)
+                metrics.update(val_metrics)
             if self._scheduler is not None:
                 self._scheduler.step()
+            self._state = self._capture(epoch)
+            for checkpoint in checkpoints:
+                checkpoint.update(self._state, metrics)
+
+    def _capture(self, epoch: int) -> TrainerState:
+        scheduler = (
+            None
+            if self._scheduler is None
+            else self._scheduler.state_dict()
+        )
+        return {
+            "epoch": epoch,
+            "model": self._model.state_dict(),
+            "optimizer": self._optimizer.state_dict(),
+            "scheduler": scheduler,
+        }
 
     def _run_train_epoch(
         self,
