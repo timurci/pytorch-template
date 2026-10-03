@@ -259,6 +259,15 @@ class TrainingConfig(ConfigModel):
             raise ValueError(
                 "training.checkpoints allows at most one best entry"
             )
+        best = self.best()
+        if best is not None:
+            recovery_path = self.recovery().path.resolve()
+            best_path = best.path.resolve()
+            if recovery_path == best_path:
+                raise ValueError(
+                    "training.checkpoints recovery and best paths must "
+                    f"differ, both resolve to {recovery_path}"
+                )
         return self
 
     def recovery(self) -> RecoveryCheckpointConfig:

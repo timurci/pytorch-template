@@ -326,6 +326,15 @@ def test_checkpoint_cardinality_is_enforced() -> None:
         ExperimentConfig.model_validate(
             training([{"kind": "recovery", "path": "a.pt", "every": 0}])
         )
+    with pytest.raises(ValidationError, match="paths must differ"):
+        ExperimentConfig.model_validate(
+            training(
+                [
+                    {"kind": "recovery", "path": "outputs/model.pt"},
+                    {"kind": "best", "path": "./outputs/model.pt"},
+                ]
+            )
+        )
 
 
 def _moment(optimizer: AdamW, name: str) -> torch.Tensor:
