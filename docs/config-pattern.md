@@ -59,13 +59,14 @@ composition root's own schema:
 - `ExperimentConfig` — the assembly of every layer's schemas into one
   file, plus cross-object invariants (below);
 - run-level schemas no library layer owns: `DataConfig` (which raw sources
-  feed the run, plus column roles), `TrainingConfig` / `InferenceConfig`
-  (the run itself), and `OptimizerConfig` / `SchedulerConfig` /
-  `LossConfig` (plain `torch` objects — no layer owns them).
+  feed the run, plus column roles), `TrainingConfig` / `InferenceConfig` /
+  `ReportConfig` (the run and its outputs), and `OptimizerConfig` /
+  `SchedulerConfig` / `LossConfig` (plain `torch` objects — no layer owns
+  them).
 
 The *wiring* — who calls `build()` with what and passes the result where —
-belongs to the entrypoints (`cli/train.py`, `cli/infer.py`). Nothing in
-the library layers knows about YAML.
+belongs to the entrypoints (`cli/train.py`, `cli/predict.py`, `cli/infer.py`,
+`cli/report.py`). Nothing in the library layers knows about YAML.
 
 | YAML slot | Union (`kind`-tagged) | Schema module | Builds |
 | --- | --- | --- | --- |
@@ -113,9 +114,9 @@ RawSourceConfig = Annotated[
 ## Loading
 
 `load_config(path)` (in `cli/config.py`) is the only place the file is
-read: `yaml.safe_load` → `ExperimentConfig.model_validate`. Both
-entrypoints call it with `-c/--config` and both validate the *whole* file,
-so an invalid value in the inference section fails training too — one
+read: `yaml.safe_load` → `ExperimentConfig.model_validate`. All three
+entrypoints call it with `-c/--config` and all validate the *whole* file,
+so an invalid value in the report section fails training too — one
 file is the single source of truth for "what experiment is this".
 Unrecognized keys are errors (`ConfigModel` sets `extra="forbid"`), so a
 misspelled field fails at load along with wrong `kind`s, wrong types, and
@@ -224,7 +225,7 @@ Same recipe, one layer down. Say ingestion should also accept JSON files:
 3. Register: `RawSourceConfig = Annotated[
    CsvSourceConfig | ParquetSourceConfig | JsonSourceConfig,
    Field(discriminator="kind")]`.
-4. YAML: `data: {train: {kind: json, path: data/train.json}, ...}`.
+4. YAML: `data: {train: {kind: json, path: data/raw/train.json}, ...}`.
 
 Again the CLI is untouched: it already calls `config.data.train.build()`.
 Remember that readers stay **unvalidated** — roles and raw steps are

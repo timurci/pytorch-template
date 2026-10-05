@@ -2,8 +2,9 @@
 
 One config file describes the whole experiment: data sources and column
 roles, feature processing, model architecture, optimizer/scheduler/loss,
-training loop, and inference output. `template-train` and `template-infer`
-validate the same file and each use their own sections.
+training loop, inference output, and the analysis report. `template-train`,
+`template-infer`, and `template-report` validate the same file and each use
+their own sections.
 
 This module is the composition root's own schema: `ExperimentConfig`
 assembles the layers' config schemas (`template.<layer>.config` — each
@@ -283,7 +284,18 @@ class InferenceConfig(ConfigModel):
     batch_size: int = Field(default=8192, gt=0)
     save: bool = True
     report: bool = True
-    output_path: Path = Path("outputs/predictions.csv")
+    output_path: Path = Path("data/report/predictions.csv")
+
+
+class ReportConfig(ConfigModel):
+    """What `template-report` writes and at which operating point.
+
+    Distinct from `inference.report`, which only toggles the one-line
+    probability summary of a `template-infer` run.
+    """
+
+    output_path: Path = Path("data/report/report.md")
+    threshold: float = Field(default=0.5, gt=0, lt=1)
 
 
 class ExperimentConfig(ConfigModel):
@@ -296,6 +308,7 @@ class ExperimentConfig(ConfigModel):
     loss: LossConfig = Field(default_factory=CrossEntropyLossConfig)
     training: TrainingConfig
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
+    report: ReportConfig = Field(default_factory=ReportConfig)
 
     @model_validator(mode="after")
     def _validate_target_classes(self) -> Self:

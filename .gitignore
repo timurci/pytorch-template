@@ -1,6 +1,6 @@
 .venv/
-/data/
-outputs/
+/data/*
+!/data/README.md
 mlruns/
 __pycache__/
 *.pyc

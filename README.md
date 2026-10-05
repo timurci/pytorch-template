@@ -18,7 +18,11 @@ new component (model, source, step, tracker) configurable — is
 | `models` | `nn.Module` architectures (reference: `MLPClassifier`) |
 | `tracking` | `ExperimentTracker` protocol; `null` / `stdout` / `mlflow` adapters |
 | `training` | `Trainer`: the epoch loop; optional epoch `LRScheduler`; applies the tensor pipeline per batch; trackers and checkpoint strategies injected |
-| `cli` | Entrypoints (`template-train` / `template-infer`); the composition-root schema (`cli/config.py`) and wiring |
+| `cli` | Entrypoints (`template-train` / `template-infer` / `template-report`); the composition-root schema (`cli/config.py`) and wiring |
+
+`evaluation.py` is a `torch`-only leaf, like `config_pattern.py`:
+binary-classification scores for `template-report`, over the class-1
+probability the inference contract emits.
 
 Preprocessing splits in two by *where it runs*. **Raw processing**
 (`features.raw`) is a pipeline of steps over the named raw columns, applied
@@ -32,15 +36,23 @@ transform that can wait.
 
 ```bash
 uv sync
-cp configs/example.yaml.example configs/example.yaml   # edit paths/columns
+cp configs/example.yaml.example configs/example.yaml  # edit paths/columns
 uv run template-train --config configs/example.yaml
 uv run template-infer --config configs/example.yaml
+uv run template-report --config configs/example.yaml
 ```
 
 Training writes the recovery checkpoint and, when configured, the best
 checkpoint. Inference loads the best file when it exists, otherwise the
 recovery file, and writes `inference.output_path` (`id,<target>` with
-class-1 probabilities). Full field reference: [docs/cli.md](docs/cli.md).
+class-1 probabilities). The report evaluates that same checkpoint over
+`data.test` and writes `report.output_path` (markdown). Full field
+reference: [docs/cli.md](docs/cli.md).
+
+The example config follows the `data/` layout — inputs in `data/raw`,
+checkpoints in `data/model`, generated artifacts in `data/report`
+([data/README.md](data/README.md) explains the split and why it is only a
+suggestion). Point the config's paths wherever you like.
 
 ## Using it as a template
 
@@ -50,7 +62,8 @@ class-1 probabilities). Full field reference: [docs/cli.md](docs/cli.md).
 2. Adapt the marked layers to your task: `data.Batch` + the dataset adapter
    (+ the source ports if your raw form is not a table), your raw steps in
    `features/raw.py` and tensor steps in `features/tensor.py`, your models,
-   your trainer specialization.
+   your trainer specialization, and `evaluation.py` if the task is not
+   binary classification.
 3. Give each new implementation an `XConfig` alongside its class (its module
    or the layer's `config.py`) and register it in the slot's `kind` union
    ([docs/config-pattern.md](docs/config-pattern.md) has recipes).

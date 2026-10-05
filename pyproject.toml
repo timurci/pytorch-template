@@ -21,6 +21,7 @@ dependencies = [
 [project.scripts]
 template-train = "template.cli.train:main"
 template-infer = "template.cli.infer:main"
+template-report = "template.cli.report:main"
 
 [build-system]
 requires = ["uv_build>=0.11.21,<0.12.0"]
