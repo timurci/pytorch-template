@@ -38,7 +38,7 @@ serves.
 | `models` | Network definitions | `nn.Module` subclasses, e.g. `MLPClassifier`; `models/config.py` schemas | Anything but `torch` (its `config.py` may add `pydantic`) |
 | `tracking` | Observability port | `ExperimentTracker` protocol; `Null` / `Stdout` / `MLflow` adapters, and their `config.py` schemas | Owning external lifecycles (the CLI opens/closes the MLflow run) |
 | `training` | The training loop and checkpoint strategies | `Trainer`, `CheckpointStrategy`, the recovery and best strategies, and their `config.py` schemas | Touching sources or splitting data, building models/loaders/schedulers, choosing checkpoint paths, resuming a run, opening tracker runs |
-| `cli` | Entrypoints / composition root | The composition-root schema (`cli/config.py`: `ExperimentConfig`, `DataConfig`, `TrainingConfig` / `InferenceConfig`, optimizer/scheduler/loss schemas) and the `build()` wiring, `template-train`, `template-infer` | Contain business logic — it only wires layers |
+| `cli` | Entrypoints / composition root | The composition-root schema (`cli/config.py`: `ExperimentConfig`, `DataConfig`, `TrainingConfig` / `InferenceConfig` / `ReportConfig`, optimizer/scheduler/loss schemas) and the `build()` wiring, `template-train`, `template-infer`, `template-report` | Contain business logic — it only wires layers |
 
 ## Dependency rules
 
@@ -87,12 +87,15 @@ The allowed edges, exactly:
   `data`'s remaining modules import only each other (and `polars` /
   `torch`).
 - `models` and `tracking` import nothing from sibling layers.
+- `evaluation` (`template/evaluation.py`) is a leaf like `config_pattern`:
+  `torch` only, no sibling layer imports. `template-report` imports it; no
+  layer does.
 
 Everything else (constructing the model, the optimizer, the scheduler, the
 loaders, the trackers, the tensor pipeline, resuming from a checkpoint,
-and choosing which file inference loads) happens in the entrypoint and is
-passed in. Checkpoint strategies, passed into the trainer, decide when to
-write.
+choosing which file inference loads, computing the report's metrics, and
+writing its artifact) happens in the entrypoint and is passed in. Checkpoint
+strategies, passed into the trainer, decide when to write.
 
 ## The batch contract
 
@@ -385,8 +388,8 @@ ranking tasks rewrite `trainer.py` (and probably `Batch`) for their project.
 
 One YAML file describes the whole experiment: data sources and column
 roles, raw and tensor processing, model, optimizer, scheduler, loss, training
-loop, inference output. The pattern (normative detail and extension recipes:
-[config-pattern.md](config-pattern.md)):
+loop, inference output, and the analysis report. The pattern (normative
+detail and extension recipes: [config-pattern.md](config-pattern.md)):
 
 - Each schema lives **with the class it builds** — in the class's module
   (`features/raw.py`, `features/tensor.py`) or the layer's `config.py`
@@ -410,9 +413,9 @@ loop, inference output. The pattern (normative detail and extension recipes:
   a single member.
 - Cross-field invariants (e.g. the target mapping covers exactly the
   classifier's `0..n_classes-1`) are model validators on `ExperimentConfig`.
-- `load_config` is the only place the file is read, and both entrypoints
-  validate the *whole* file, so a typo in the inference section fails
-  training too — one file is the single source of truth for "what
+- `load_config` is the only place the file is read, and all three
+  entrypoints validate the *whole* file, so a typo in the report section
+  fails training too — one file is the single source of truth for "what
   experiment is this".
 
 This is where "configurable setups" fit architecturally: configuration is
@@ -421,9 +424,10 @@ hand-written `main()` wiring function with a declarative, validated file.
 
 ## Entrypoints
 
-`template-train` and `template-infer` merge what DDD would split into
-presentation and application layers — for a training project that split is
-ceremony, so the CLI both parses args/config and orchestrates the use case:
+`template-train`, `template-infer`, and `template-report` merge what DDD
+would split into presentation and application layers — for a training project
+that split is ceremony, so the CLI both parses args/config and orchestrates
+the use case:
 
 `template-train`: `config.data.train.build()` →
 `config.raw.build(raw.columns)` + `ProcessedSource` →
@@ -437,14 +441,22 @@ flattened config as params → optionally `restore_training_state` from the
 recovery checkpoint when `--resume` is set → `Trainer.train(tensor_pipeline=…,
 seed=…, start_epoch=…, checkpoints=…)`.
 
-`template-infer`: `config.data.test.build()` → `config.raw.build(raw.columns)`
-+ `ProcessedSource` → schema built with `include_target=False` (target
-dropped when present, absent otherwise) → ids read through the validated
-source (metadata rides through untouched, row order preserved) → model
-rebuilt from the same config, weights loaded from the best checkpoint when
-that file exists and otherwise from the recovery checkpoint, `eval()` → per
-batch: the tensor pipeline at stage `predict`, then
-`softmax(logits, dim=1)[:, 1]` → report/save `id,<target>`.
+`template-infer` and `template-report` share `cli/predict.py` for one pass
+over `data.test`: `config.data.test.build()` →
+`config.raw.build(raw.columns)` + `ProcessedSource` → schema built with
+`include_target=False` (inference) or `True` (report; the target is then
+required) → ids read through the validated source (metadata rides through
+untouched, row order preserved) → model rebuilt from the same config, weights
+loaded from the best checkpoint when that file exists and otherwise from the
+recovery checkpoint (`--checkpoint` overrides it for the report), `eval()` →
+per batch: the tensor pipeline at stage `predict`, then
+`softmax(logits, dim=1)[:, 1]`.
+
+`template-infer` then reports/saves `id,<target>`; `template-report` passes
+the probabilities and the retained targets to
+`evaluation.binary_metrics(..., threshold=report.threshold)` and writes the
+markdown analysis. One shared pass is what makes the report describe the same
+rows as inference.
 
 A backend API entrypoint would do the same wiring inside request handlers
 instead of `argparse` mains; nothing in the library changes.
@@ -464,8 +476,9 @@ instead of `argparse` mains; nothing in the library changes.
    the current contract forbids.
 4. Add your architecture(s) as `kind`s in `models/config.py` (or replace
    `MLPClassifier` outright).
-5. If the task isn't classification, rewrite `training/trainer.py` for your
-   metrics and the model/loss schemas to match.
+5. If the task isn't binary classification, rewrite `training/trainer.py`
+   for your metrics and the model/loss schemas to match, and `evaluation.py`
+   (with its rendering in `cli/report.py`) for the report.
 6. Give every new component an `XConfig` in its layer — its `config.py`, or
    alongside the class in `features/raw.py` / `features/tensor.py` — and
    register its `kind` in the slot's union

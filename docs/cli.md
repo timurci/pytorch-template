@@ -1,25 +1,29 @@
 # CLI reference
 
-Two console scripts, both driven by one YAML experiment config:
+Three console scripts, all driven by one YAML experiment config:
 
 ```bash
 uv run template-train --config configs/example.yaml
 uv run template-train --config configs/example.yaml --resume
 uv run template-infer --config configs/example.yaml
+uv run template-report --config configs/example.yaml
 ```
 
 | Command | Config sections used | Result |
 | --- | --- | --- |
 | `template-train` | `data`, `raw`, `tensor`, `model`, `optimizer`, `scheduler`, `loss`, `training` | recovery checkpoint, and a best checkpoint when configured |
 | `template-infer` | `data`, `raw`, `tensor`, `model`, `inference`, `training.checkpoints` / `training.seed` | `inference.output_path` (`id,<target>`) |
+| `template-report` | `data.test`, `raw`, `tensor`, `model`, `inference.batch_size`, `report`, `training.checkpoints` / `training.seed` | `report.output_path` (markdown analysis) |
 
-Both commands validate the whole file, so a typo anywhere fails fast. Run
-`uv run template-train --help` for the flags.
+All three commands validate the whole file, so a typo anywhere fails fast.
+Run `uv run template-train --help` for the flags (each command has its own).
 
 ## Config file
 
 - `-c/--config` is required and must point to a YAML mapping.
 - Paths are relative to the working directory, not to the config file.
+  [data/README.md](../data/README.md) suggests one layout for them; nothing
+  enforces it.
 - Unknown fields are rejected, so misspelled keys are errors.
 - `kind` may be omitted only where a section declares a default kind
   (`model` → `mlp`, `optimizer` → `adamw`, `loss` → `cross_entropy`);
@@ -56,7 +60,7 @@ feature set and width are logged at startup.
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `train` | source | required | raw reader for `template-train`, picked by `kind` |
-| `test` | source | required | raw reader for `template-infer`, picked by `kind` |
+| `test` | source | required | raw reader for `template-infer` and `template-report`, picked by `kind` |
 | `id_column` | str | `id` | always metadata: kept untouched and reassembled into the predictions (merged into `metadata`) |
 | `target.column` | str | required | label column; also the prediction column name |
 | `target.mapping` | map[str, int] | required | class indices; non-empty, injective, must cover exactly `0..n_classes-1` |
@@ -211,7 +215,23 @@ not kinds: the trainer calls `step()` with no arguments, once per epoch.
 | `batch_size` | 8192 | inference loader |
 | `save` | true | write `output_path` |
 | `report` | true | print row count and probability summary |
-| `output_path` | `outputs/predictions.csv` | `id,<target column>` |
+| `output_path` | `data/report/predictions.csv` | `id,<target column>` |
+
+### `report`
+
+What `template-report` writes, and at which operating point. Optional;
+these are the defaults. Distinct from `inference.report`, which only toggles
+the one-line probability summary of an inference run.
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `output_path` | `data/report/report.md` | markdown analysis of `data.test` |
+| `threshold` | 0.5 | probability at or above which a row is predicted positive; drives the confusion matrix and its rates |
+
+The report scores the class-1 probability the inference contract emits, so
+it is binary-classification only: a target mapping that is not exactly
+`{0, 1}` fails at startup. Extending it (multiclass, regression) means new
+functions in `evaluation.py` and a new rendering in `cli/report.py`.
 
 ## Checkpoints
 
@@ -238,6 +258,8 @@ ignored. Resuming does not repeat the training loader's shuffle order.
 `template-infer` loads model weights from the best file when that entry
 exists and the file is present, otherwise from the recovery file. The
 config must describe the same model the checkpoint was trained with.
+`template-report` uses the same rule, so a report matches what inference
+serves; `--checkpoint PATH` overrides it to score a specific file.
 
 ## Trackers and logging
 
@@ -268,12 +290,12 @@ device=cpu rows=1200+134 epochs=10
 params {'data.train.kind': 'csv', ..., 'tensor.steps': '[...]', ...}
 step=0 metrics {'train/loss': 0.2421, 'train/accuracy': 0.8897, ...}
 step=0 metrics {'val/loss': 0.2379, 'val/accuracy': 0.8925, ...}
-saved checkpoint to outputs/best.pt
+saved checkpoint to data/model/best.pt
 ```
 
 The best file is written on the first epoch and again whenever the score
 improves. The recovery file is written on its interval and on the final
-epoch, as `saved checkpoint to outputs/recovery.pt`.
+epoch, as `saved checkpoint to data/model/recovery.pt`.
 
 `features: ...` is the resolved feature set and width — logged on purpose, so
 a stray or leaky column surfaces here (and in the tracked params) instead of
@@ -287,7 +309,7 @@ prints:
 ```
 rows=500
 probability mean=0.241765 min=0.000055 max=0.929446
-saved predictions to outputs/predictions.csv
+saved predictions to data/report/predictions.csv
 ```
 
 ## What the commands do
@@ -339,6 +361,22 @@ saved predictions to outputs/predictions.csv
    `softmax(logits, dim=1)[:, 1]`.
 4. Optionally report and/or save `id,<target>`.
 
+`template-report` runs the same pass with `include_target=True` — the target
+survives ingestion, so every batch carries labels — then:
+
+1. `binary_metrics(probabilities, targets, threshold=report.threshold)`
+   (`evaluation.py`) returns the operating point's confusion matrix and its
+   rates, plus the threshold-free `roc_auc`, `average_precision`, `brier`,
+   and `log_loss` of the same rows.
+2. Log a one-line summary and write `report.output_path` (markdown): the
+   threshold-free table, the confusion matrix at the configured threshold,
+   and a sweep over `0.1 … 0.9`.
+
+`cli/predict.py` owns steps 1–3 of both commands, so `template-infer` and
+`template-report` score the same rows with the same seeded pass; only the
+label handling and the output differ. A target mapping that is not
+`{0, 1}` fails `template-report` at startup.
+
 ## Artifacts
 
 - The recovery checkpoint holds the training state (epoch, model weights,
@@ -347,4 +385,9 @@ saved predictions to outputs/predictions.csv
   so the inference config must describe the same model.
 - `inference.output_path` is a CSV with the configured id column and the target
   column, holding probabilities of class `1` in `[0, 1]`.
-- Both paths create parent directories automatically.
+- `report.output_path` is a markdown analysis of `data.test`: a threshold-free
+  table, the confusion matrix at `report.threshold`, and a threshold sweep.
+  It is a plain function of one checkpoint and one labeled test set, so it is
+  re-runnable without retraining; `--checkpoint` picks the file.
+- Checkpoint, predictions, and report paths create parent directories
+  automatically.

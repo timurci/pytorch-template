@@ -1,18 +1,20 @@
 # Shared experiment config template.
-# `template-train` and `template-infer` both validate this file; each uses its
-# own sections. See docs/cli.md for the full field reference, and
-# docs/config-pattern.md for the schema pattern and how to add a `kind`.
+# `template-train`, `template-infer`, and `template-report` all validate this
+# file; each uses its own sections. See docs/cli.md for the full field
+# reference, and docs/config-pattern.md for the schema pattern and how to add
+# a `kind`.
 # Paths are relative to the working directory.
 
 data:
   # Raw readers are picked by `kind`: csv | parquet. A new reader kind is
   # one schema in persistence/config.py (docs/config-pattern.md).
+  # Suggested layout for these paths and the outputs below: data/README.md.
   train:
     kind: csv
-    path: data/train.csv
+    path: data/raw/train.csv
   test:
     kind: csv
-    path: data/test.csv
+    path: data/raw/test.csv
   id_column: id # always metadata: kept untouched, reassembled into predictions
   target:
     column: label
@@ -35,6 +37,10 @@ raw:
     - kind: one_hot
       column: city
       levels: [a, b, c]
+      # For a vocabulary too large for YAML, declare `levels_path` instead
+      # (exactly one of the two): data/feature/city_levels.txt, one level
+      # per line. Anything here is an input the run declares, not state the
+      # pipeline fits — see data/README.md.
     # - kind: drop_columns
     #   columns: [unused_note]
 
@@ -126,13 +132,23 @@ training:
   # kept on the lowest val/loss (train/loss when validation is off).
   checkpoints:
     - kind: recovery
-      path: outputs/recovery.pt
+      path: data/model/recovery.pt
       # every: 5
     - kind: best
-      path: outputs/best.pt
+      path: data/model/best.pt
 
 inference:
   batch_size: 8192
   save: true # write output_path as id,label (class-1 probabilities)
   report: true # print rows + probability summary
-  output_path: outputs/predictions.csv
+  output_path: data/report/predictions.csv
+
+# `template-report` scores the same checkpoint over `data.test` (which keeps
+# its target here, unlike inference) and writes a markdown analysis: a
+# threshold-free table (roc_auc, average_precision, brier, log_loss), the
+# confusion matrix at `threshold`, and a threshold sweep. Binary
+# classification only — it reads the class-1 probability the inference
+# contract emits.
+report:
+  output_path: data/report/report.md
+  threshold: 0.5 # operating point for accuracy/precision/recall/f1
