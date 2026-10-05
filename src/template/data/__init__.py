@@ -1,10 +1,15 @@
-"""The role-declared schema, ingestion encoders, and torch dataset adapter."""
+"""The role-declared column schema and the torch-side dataset adapter.
 
-from template.data.encoding import MapValues, OneHot
+Raw processing — the pipeline of steps over raw columns — lives in
+`features.raw`; `ProcessedSource` here applies it, `ValidatedSource` checks
+the roles, and `TableDataset` tensorizes.
+"""
+
 from template.data.schema import TableSchema
 from template.data.source import DataSource, RawTableSource
 from template.data.table import (
     Batch,
+    ProcessedSource,
     TableDataset,
     ValidatedSource,
     ValidatedTable,
@@ -15,8 +20,7 @@ from template.data.table import (
 __all__ = [
     "Batch",
     "DataSource",
-    "MapValues",
-    "OneHot",
+    "ProcessedSource",
     "RawTableSource",
     "TableDataset",
     "TableSchema",

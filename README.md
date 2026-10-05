@@ -13,12 +13,20 @@ new component (model, source, step, tracker) configurable — is
 | Layer | Role |
 | --- | --- |
 | `persistence` | Raw table readers (`CsvSource` / `ParquetSource`) + table/checkpoint I/O; caller supplies paths |
-| `data` | Ingestion: `RawTableSource` / `DataSource` ports, `TableSchema` (column roles + encodings), `ValidatedTable` / `ValidatedSource`, the `Batch` contract, and the torch-side `TableDataset` adapter; no file I/O |
-| `features` | Feature processing: `ProcessingStep` / `ProcessingPipeline` — tensor-only preprocessing and augmentation in one stage-tagged, seeded machinery |
+| `data` | Ingestion: `RawTableSource` / `DataSource` ports, `TableSchema` (column roles), `ProcessedSource` (applies the raw pipeline), `ValidatedTable` / `ValidatedSource`, the `Batch` contract, the torch-side `TableDataset`, split/target-statistics helpers; no file I/O |
+| `features` | Preprocessing, split by file: `features.raw` — a `RawPipeline` of `RawStep`s over the named raw columns (selection, encoding) at read time — and `features.tensor` — `TensorStep` / `TensorPipeline`, stage-tagged, seeded batch steps applied on the target device |
 | `models` | `nn.Module` architectures (reference: `MLPClassifier`) |
 | `tracking` | `ExperimentTracker` protocol; `null` / `stdout` / `mlflow` adapters |
-| `training` | `Trainer`: the epoch loop; optional epoch `LRScheduler`; applies the processing pipeline per batch; trackers and checkpoint strategies injected |
+| `training` | `Trainer`: the epoch loop; optional epoch `LRScheduler`; applies the tensor pipeline per batch; trackers and checkpoint strategies injected |
 | `cli` | Entrypoints (`template-train` / `template-infer`); the composition-root schema (`cli/config.py`) and wiring |
+
+Preprocessing splits in two by *where it runs*. **Raw processing**
+(`features.raw`) is a pipeline of steps over the named raw columns, applied
+at read time on the CPU; it is the only place raw values and column names
+are visible, so selection, renaming, deriving, and encoding live there.
+**Tensor processing** (`features.tensor`) runs on the target device,
+vectorized over a batch, during training and inference — prefer it for any
+transform that can wait.
 
 ## Quickstart
 
@@ -40,10 +48,11 @@ class-1 probabilities). Full field reference: [docs/cli.md](docs/cli.md).
    (pyproject), and the `"template"` logger in `cli/runtime.py` — all
    greppable as `template`.
 2. Adapt the marked layers to your task: `data.Batch` + the dataset adapter
-   (+ the source ports if your raw form is not a table), your models, your
-   processing steps, your trainer specialization.
-3. Give each new implementation an `XConfig` in its layer's `config.py` and
-   register it in the slot's `kind` union
+   (+ the source ports if your raw form is not a table), your raw steps in
+   `features/raw.py` and tensor steps in `features/tensor.py`, your models,
+   your trainer specialization.
+3. Give each new implementation an `XConfig` alongside its class (its module
+   or the layer's `config.py`) and register it in the slot's `kind` union
    ([docs/config-pattern.md](docs/config-pattern.md) has recipes).
 
 Step-by-step: [docs/architecture.md#instantiating-the-template](docs/architecture.md#instantiating-the-template).

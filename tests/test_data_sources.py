@@ -1,4 +1,4 @@
-"""Tests for the ingestion seam: roles, encodings, validation, datasets."""
+"""Tests for the ingestion seam: raw processing, roles, validation, datasets."""
 
 from collections.abc import Sequence
 
@@ -6,8 +6,7 @@ import polars as pl
 import pytest
 
 from template.data import (
-    MapValues,
-    OneHot,
+    ProcessedSource,
     TableDataset,
     TableSchema,
     ValidatedSource,
@@ -15,6 +14,7 @@ from template.data import (
     class_counts,
     partition_indices,
 )
+from template.features.raw import MapValues, OneHot, RawPipeline
 from template.persistence import CsvSource, save_table
 
 
@@ -46,37 +46,60 @@ def _frame() -> pl.DataFrame:
     )
 
 
-def _schema() -> TableSchema:
+def _processed() -> ProcessedSource:
+    return ProcessedSource(
+        FrameSource(_frame()),
+        RawPipeline([OneHot("city", ["a", "b", "c"])], _frame().columns),
+    )
+
+
+def _schema(columns: Sequence[str]) -> TableSchema:
     return TableSchema.from_columns(
-        ["id", "city", "age", "label"],
+        columns,
         target="label",
         metadata=["id"],
-        feature_encoders={"city": OneHot(["a", "b", "c"])},
         target_encoder=MapValues({"neg": 0, "pos": 1}),
     )
 
 
 def _source() -> ValidatedSource:
-    return ValidatedSource(FrameSource(_frame()), _schema())
+    processed = _processed()
+    return ValidatedSource(processed, _schema(processed.columns))
+
+
+def test_processed_source_exposes_declared_output_columns() -> None:
+    processed = _processed()
+    assert processed.columns == (
+        "id",
+        "age",
+        "label",
+        "city=a",
+        "city=b",
+        "city=c",
+    )
+    assert processed.count() == 8
+    # The pipeline's declaration equals what a read actually produces.
+    assert processed.read([0]).columns == list(processed.columns)
 
 
 def test_from_columns_assigns_roles() -> None:
-    schema = _schema()
-    assert schema.feature_columns == ("city", "age")
+    processed = _processed()
+    schema = _schema(processed.columns)
+    assert schema.feature_columns == ("age", "city=a", "city=b", "city=c")
     assert schema.metadata_columns == ("id",)
     assert schema.target_column == "label"
-    # One-hot block plus one numeric column; known before any row is read.
+    # One-hot levels plus one numeric column; known before any row is read.
     assert schema.feature_width == 4
-    assert schema.feature_slice("city") == slice(0, 3)
-    assert schema.feature_slice("age") == slice(3, 4)
+    assert schema.feature_slice("age") == slice(0, 1)
+    assert schema.feature_slice("city=c") == slice(3, 4)
 
 
 def test_exclude_is_enough_to_shape_the_feature_set() -> None:
     schema = TableSchema.from_columns(
-        ["id", "city", "age", "label"],
+        ["id", "age", "label", "city=a"],
         target="label",
         metadata=["id"],
-        exclude=["city"],
+        exclude=["city=a"],
     )
     assert schema.feature_columns == ("age",)
     with pytest.raises(KeyError):
@@ -116,23 +139,6 @@ def test_target_encoder_requires_a_target_column() -> None:
         )
 
 
-def test_one_hot_encode_and_uncovered_values() -> None:
-    encoder = OneHot(["a", "b", "c"])
-    encoded = encoder.encode(pl.Series("city", ["b", "a"]))
-    assert encoded.shape == (2, 3)
-    assert encoded.tolist() == [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
-    with pytest.raises(ValueError, match="not covered"):
-        encoder.encode(pl.Series("city", ["z"]))
-
-
-def test_one_hot_levels_from_file(tmp_path) -> None:
-    levels = tmp_path / "vocab.txt"
-    levels.write_text("a\nb\n")
-    encoder = OneHot(levels_path=levels)
-    assert encoder.width == 2
-    assert encoder.encode(pl.Series("city", ["b"])).tolist() == [[0.0, 1.0]]
-
-
 def test_map_values_encodes_targets() -> None:
     encoder = MapValues({"neg": 0, "pos": 1})
     assert encoder.encode(pl.Series("label", ["pos", "neg"])).tolist() == [
@@ -148,11 +154,11 @@ def test_validated_source_serves_encoded_batches() -> None:
     assert source.count() == 8
     dataset = TableDataset(source)
     row = dataset[0]
-    # city "a" -> one-hot block, then scaled-age column at index 3.
-    assert row["features"].tolist() == [1.0, 0.0, 0.0, 20.0]
+    # city "a" -> 1.0 in city=a, then the age column at index 0.
+    assert row["features"].tolist() == [20.0, 1.0, 0.0, 0.0]
     assert row["targets"].item() == 0
     batched = dataset.__getitems__([3, 1, 1])
-    assert [item["features"][3].item() for item in batched] == [50.0, 30.0, 30.0]
+    assert [item["features"][0].item() for item in batched] == [50.0, 30.0, 30.0]
     assert [item["targets"].item() for item in batched] == [1, 1, 1]
 
 
@@ -162,18 +168,26 @@ def test_metadata_rides_through_untouched() -> None:
     assert ids.to_list() == [5, 2]
 
 
-def test_extra_columns_are_ignored() -> None:
-    frame = _frame().with_columns(pl.Series("note", ["x"] * 8))
-    source = ValidatedSource(FrameSource(frame), _schema())
-    assert TableDataset(source)[0]["features"].shape == (4,)
+def test_columns_outside_the_roles_are_ignored() -> None:
+    processed = _processed()
+    schema = TableSchema.from_columns(
+        processed.columns,
+        target="label",
+        metadata=["id"],
+        exclude=["age"],
+        target_encoder=MapValues({"neg": 0, "pos": 1}),
+    )
+    source = ValidatedSource(processed, schema)
+    assert TableDataset(source)[0]["features"].shape == (3,)
 
 
 def test_validation_rejects_missing_and_non_numeric() -> None:
-    schema = _schema()
+    processed = _processed()
+    schema = _schema(processed.columns)
     with pytest.raises(KeyError):
         ValidatedTable(_frame().drop("age"), schema)
     bare = TableSchema(feature_columns=("city",))
-    with pytest.raises(TypeError, match="need an encoder"):
+    with pytest.raises(TypeError, match="raw step"):
         ValidatedTable(_frame(), bare)
 
 

@@ -8,7 +8,7 @@ from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from template.data import Batch
-from template.features import ProcessingPipeline, Stage
+from template.features.tensor import Stage, TensorPipeline
 from template.tracking.protocol import ExperimentTracker
 from template.training.checkpoint import CheckpointStrategy, TrainerState
 
@@ -35,7 +35,7 @@ class Trainer:
     support log `0.0` so trackers never see NaN; macros are unweighted means
     over all classes.
 
-    An optional `ProcessingPipeline` runs on each batch after the move to
+    An optional `TensorPipeline` runs on each batch after the move to
     `device`: training batches at stage `train`, validation batches at stage
     `eval` (so seeded validation-time augmentation is a tagging choice in
     the pipeline, not trainer code). Processed features and labels replace
@@ -105,7 +105,7 @@ class Trainer:
         loss_fn: Callable[[Tensor, Tensor], Tensor],
         trackers: Sequence[ExperimentTracker] = (),
         checkpoints: Sequence[CheckpointStrategy] = (),
-        processing: ProcessingPipeline | None = None,
+        tensor_pipeline: TensorPipeline | None = None,
         seed: int = 0,
         track_gradients: bool = False,
     ) -> None:
@@ -118,7 +118,7 @@ class Trainer:
             train_metrics = self._run_train_epoch(
                 train_loader,
                 loss_fn,
-                processing=processing,
+                tensor_pipeline=tensor_pipeline,
                 seed=seed,
                 epoch=epoch,
                 track_gradients=track_gradients,
@@ -129,7 +129,7 @@ class Trainer:
                 val_metrics = self._run_val_epoch(
                     val_loader,
                     loss_fn,
-                    processing=processing,
+                    tensor_pipeline=tensor_pipeline,
                     seed=seed,
                     epoch=epoch,
                 )
@@ -159,7 +159,7 @@ class Trainer:
         loader: DataLoader[Batch],
         loss_fn: Callable[[Tensor, Tensor], Tensor],
         *,
-        processing: ProcessingPipeline | None = None,
+        tensor_pipeline: TensorPipeline | None = None,
         seed: int = 0,
         epoch: int = 0,
         track_gradients: bool = False,
@@ -171,7 +171,7 @@ class Trainer:
             loss_fn,
             self._device,
             optimizer=self._optimizer,
-            processing=processing,
+            tensor_pipeline=tensor_pipeline,
             stage="train",
             seed=seed,
             epoch=epoch,
@@ -188,7 +188,7 @@ class Trainer:
         loader: DataLoader[Batch],
         loss_fn: Callable[[Tensor, Tensor], Tensor],
         *,
-        processing: ProcessingPipeline | None = None,
+        tensor_pipeline: TensorPipeline | None = None,
         seed: int = 0,
         epoch: int = 0,
     ) -> dict[str, float]:
@@ -199,7 +199,7 @@ class Trainer:
                 loader,
                 loss_fn,
                 self._device,
-                processing=processing,
+                tensor_pipeline=tensor_pipeline,
                 stage="eval",
                 seed=seed,
                 epoch=epoch,
@@ -251,7 +251,7 @@ def _run_epoch(
     device: torch.device,
     optimizer: Optimizer | None = None,
     *,
-    processing: ProcessingPipeline | None = None,
+    tensor_pipeline: TensorPipeline | None = None,
     stage: Stage = "train",
     seed: int = 0,
     epoch: int = 0,
@@ -272,8 +272,8 @@ def _run_epoch(
         }
         if "source_indices" in batch:
             moved["source_indices"] = batch["source_indices"].to(device)
-        if processing is not None:
-            moved = processing.process(
+        if tensor_pipeline is not None:
+            moved = tensor_pipeline.process(
                 moved,
                 stage=stage,
                 rng=_batch_rng(seed, stage, epoch, index),

@@ -16,6 +16,7 @@ from template.cli.runtime import (
     tracking,
 )
 from template.data import (
+    ProcessedSource,
     TableDataset,
     ValidatedSource,
     class_counts,
@@ -40,13 +41,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     device = resolve_device(config.training.device)
 
     raw = config.data.train.build()
-    schema = config.data.build_schema(raw.columns)
+    pipeline = config.raw.build(raw.columns)
+    processed = ProcessedSource(raw, pipeline)
+    schema = config.data.build_schema(processed.columns)
     # The resolved feature set is loud on purpose: a stray or leaky column
     # shows up here (and in the tracked params) instead of in the model.
     logger.info(
         "features: %s (width %d)", schema.feature_columns, schema.feature_width
     )
-    source = ValidatedSource(raw, schema)
+    source = ValidatedSource(processed, schema)
 
     if config.training.val_fraction is None:
         train_indices = list(range(source.count()))
@@ -90,7 +93,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         else None
     )
 
-    processing = config.processing.build(schema)
+    tensor_pipeline = config.tensor.build(schema)
     model = config.model.build(schema.feature_width).to(device)
     optimizer = config.optimizer.build(model.parameters())
     scheduler = (
@@ -134,7 +137,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             loss_fn=loss_fn,
             trackers=trackers,
             checkpoints=checkpoints,
-            processing=processing,
+            tensor_pipeline=tensor_pipeline,
             seed=config.training.seed,
             track_gradients=config.training.track_gradients,
         )

@@ -24,12 +24,9 @@ from template.persistence.config import CsvSourceConfig, ParquetSourceConfig
 _TEMPLATE = Path(__file__).parent.parent / "configs" / "example.yaml.example"
 
 
-def _data(
-    train: dict[str, Any] | None = None,
-    encodings: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+def _data(train: dict[str, Any] | None = None) -> dict[str, Any]:
     default_train = {"kind": "csv", "path": "data/train.csv"}
-    raw: dict[str, Any] = {
+    return {
         "train": default_train if train is None else train,
         "test": {"kind": "csv", "path": "data/test.csv"},
         "target": {
@@ -37,9 +34,6 @@ def _data(
             "mapping": {"negative": 0, "positive": 1},
         },
     }
-    if encodings is not None:
-        raw["encodings"] = encodings
-    return raw
 
 
 def _experiment(**sections: Any) -> dict[str, Any]:
@@ -104,12 +98,12 @@ def test_kind_may_be_omitted_where_the_slot_declares_a_default() -> None:
     [
         pytest.param({"data": _data({"path": "data/train.csv"})}, id="source"),
         pytest.param(
-            {"data": _data(encodings=[{"column": "city", "levels": ["a"]}])},
-            id="encoding",
+            {"raw": {"steps": [{"column": "city", "levels": ["a"]}]}},
+            id="raw-step",
         ),
         pytest.param(
-            {"processing": {"steps": [{"column": "age", "cap": 100.0}]}},
-            id="step",
+            {"tensor": {"steps": [{"column": "age", "cap": 100.0}]}},
+            id="tensor-step",
         ),
         pytest.param(
             {
@@ -198,8 +192,8 @@ def test_balanced_weights_need_contiguous_nonzero_class_counts() -> None:
     [
         pytest.param(
             {
-                "data": _data(
-                    encodings=[
+                "raw": {
+                    "steps": [
                         {
                             "kind": "one_hot",
                             "column": "city",
@@ -207,13 +201,13 @@ def test_balanced_weights_need_contiguous_nonzero_class_counts() -> None:
                             "levels_path": "vocab.txt",
                         }
                     ]
-                )
+                }
             },
             id="one-hot-two-level-sources",
         ),
         pytest.param(
             {
-                "processing": {
+                "tensor": {
                     "steps": [
                         {
                             "kind": "scale_by_cap",
@@ -228,7 +222,7 @@ def test_balanced_weights_need_contiguous_nonzero_class_counts() -> None:
         ),
         pytest.param(
             {
-                "processing": {
+                "tensor": {
                     "steps": [
                         {
                             "kind": "log_scale_by_cap",
@@ -242,7 +236,7 @@ def test_balanced_weights_need_contiguous_nonzero_class_counts() -> None:
         ),
         pytest.param(
             {
-                "processing": {
+                "tensor": {
                     "steps": [
                         {
                             "kind": "gaussian_noise",

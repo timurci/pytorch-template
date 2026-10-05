@@ -1,7 +1,7 @@
 """Training loop and checkpoint strategies.
 
 Knows `nn.Module`, `Optimizer`, an optional epoch `LRScheduler`,
-`DataLoader[Batch]`, the tracker and processing protocols, and the
+`DataLoader[Batch]`, the tracker protocol and the tensor pipeline, and the
 checkpoint read/write helpers in `persistence`.
 """
 

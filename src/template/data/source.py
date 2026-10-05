@@ -1,9 +1,9 @@
 """The data-source port: rows by index, raw and validated.
 
 `RawTableSource` serves unvalidated frames — the raw side of the seam, for
-readers that know nothing about roles or encoding. `DataSource` serves rows
-in the validated form its consumer declares; adapters apply validation at
-the boundary (e.g. `data.table.ValidatedSource`).
+readers that know nothing about raw processing or roles. `DataSource` serves
+rows in the validated form its consumer declares; adapters apply validation
+at the boundary (e.g. `data.table.ValidatedSource`).
 """
 
 from collections.abc import Sequence

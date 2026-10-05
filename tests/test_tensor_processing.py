@@ -1,16 +1,16 @@
-"""Tests for the feature processing layer: order, stages, seeding, provenance."""
+"""Tests for the tensor processing pipeline: order, stages, seeding, provenance."""
 
 import pytest
 import torch
 
 from template.data import Batch, TableSchema
-from template.features import (
+from template.features.tensor import (
     GaussianNoise,
     LogScaleByCap,
-    ProcessingPipeline,
     ScaleByCap,
+    TensorPipeline,
+    TensorStep,
 )
-from template.features.protocol import ProcessingStep
 
 
 def _batch(rows: int = 4) -> Batch:
@@ -50,7 +50,7 @@ def test_stack_order_is_just_list_order() -> None:
     first = _RecordingStep("first", log, mul=2.0)
     second = _RecordingStep("second", log, add=3.0)
     third = _RecordingStep("third", log, mul=0.5)
-    pipeline = ProcessingPipeline(
+    pipeline = TensorPipeline(
         [(first, {"train"}), (second, {"train"}), (third, {"train"})]
     )
     out = pipeline.process(
@@ -66,7 +66,7 @@ def test_stage_tags_select_steps() -> None:
     train_only = _RecordingStep("train", log)
     eval_only = _RecordingStep("eval", log)
     everywhere = _RecordingStep("all", log)
-    pipeline = ProcessingPipeline(
+    pipeline = TensorPipeline(
         [
             (train_only, {"train"}),
             (eval_only, {"eval"}),
@@ -83,7 +83,7 @@ def test_stage_tags_select_steps() -> None:
 
 
 def test_eval_augmentation_is_seeded_and_reproducible() -> None:
-    pipeline = ProcessingPipeline(
+    pipeline = TensorPipeline(
         [(GaussianNoise(std=1.0), {"train", "eval"})]
     )
     first = pipeline.process(
@@ -106,7 +106,7 @@ def test_eval_augmentation_is_seeded_and_reproducible() -> None:
 
 def test_gaussian_noise_preserves_rows_labels_and_provenance() -> None:
     batch = _batch()
-    pipeline = ProcessingPipeline([(GaussianNoise(std=0.5), {"train"})])
+    pipeline = TensorPipeline([(GaussianNoise(std=0.5), {"train"})])
     out = pipeline.process(
         batch, stage="train", rng=torch.Generator().manual_seed(0)
     )
@@ -122,7 +122,7 @@ def test_steps_pass_untouched_fields_through() -> None:
 
     extra = torch.tensor([9, 9, 9, 9])
     batch = cast(Batch, {**_batch(), "group": extra})
-    pipeline = ProcessingPipeline([(ScaleByCap(slice(0, 1), 100.0), {"train"})])
+    pipeline = TensorPipeline([(ScaleByCap(slice(0, 1), 100.0), {"train"})])
     out = cast(
         dict[str, torch.Tensor],
         pipeline.process(
@@ -135,7 +135,7 @@ def test_steps_pass_untouched_fields_through() -> None:
 def test_scale_and_log_scale_hit_only_their_block() -> None:
     schema = TableSchema(feature_columns=("age", "income"))
     batch = _batch()
-    pipeline = ProcessingPipeline(
+    pipeline = TensorPipeline(
         [
             (ScaleByCap(schema.feature_slice("age"), 100.0), {"train"}),
             (LogScaleByCap(schema.feature_slice("income"), 10.0), {"train"}),
@@ -163,6 +163,6 @@ def test_scale_validates_bounds() -> None:
 
 def test_pipeline_step_contract_is_one_method() -> None:
     # A step is exactly `process(batch, rng) -> batch`; nothing else.
-    step: ProcessingStep = ScaleByCap(slice(0, 1), 100.0)
+    step: TensorStep = ScaleByCap(slice(0, 1), 100.0)
     out = step.process(_batch(1), torch.Generator().manual_seed(0))
     assert out["features"].shape == (1, 2)

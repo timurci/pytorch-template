@@ -2,9 +2,9 @@
 
 Readers (`CsvSource`, `ParquetSource`) load a whole table at
 construction and serve unvalidated row frames by index; they implement the
-raw side of the composition seam (`data.RawTableSource`), leaving roles,
-validation, and encoding to `data.TableSchema` / `data.ValidatedSource`.
-Save/load helpers write to caller-supplied paths.
+raw side of the composition seam (`data.RawTableSource`), leaving raw
+processing, roles, and validation to `features.raw` / `data.TableSchema` /
+`data.ValidatedSource`. Save/load helpers write to caller-supplied paths.
 """
 
 from template.persistence.io import (

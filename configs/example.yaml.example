@@ -22,20 +22,30 @@ data:
   # metadata: [] # extra columns kept untouched as sample identity (id_column
   #   is always included); metadata, target, and exclude must not overlap
   # exclude: [] # dropped columns; features are everything that remains
-  encodings:
-    # Categorical feature columns need declared levels (inline, or one level
-    # per line in a vocab file via levels_path); unlisted feature columns
-    # pass through numerically. Available kinds:
-    #   one_hot {column, levels | levels_path}
+
+raw:
+  # Raw processing (features/raw.py): ordered steps over the named raw columns,
+  # applied per read on the CPU. The pipeline declares its output columns, so
+  # column roles (and the model's input width) resolve without reading a row.
+  # Available kinds:
+  #   one_hot {column, levels | levels_path} — replaces a categorical column
+  #     with one f"{column}={level}" float column per level
+  #   drop_columns {columns} — name-based feature selection
+  steps:
     - kind: one_hot
       column: city
       levels: [a, b, c]
+    # - kind: drop_columns
+    #   columns: [unused_note]
 
-processing:
-  # One ordered list of tensor-only steps, applied per batch after the move
-  # to the training device: preprocessing and augmentation interleave freely
-  # (stacking is list order). Column names resolve to feature blocks at
-  # composition; a step on a non-feature column fails at build.
+tensor:
+  # Tensor processing (features/tensor.py): one ordered list of tensor-only
+  # steps, applied per batch after the move to the training device.
+  # Preprocessing and augmentation interleave freely (stacking is list
+  # order). Prefer this over raw processing when the raw form is not
+  # needed — the work is vectorized and runs on the accelerator. Column names
+  # resolve to feature blocks at composition; a step on a non-feature column
+  # fails at build.
   # `stages` picks where a step runs: train | eval | predict.
   #   scale_by_cap / log_scale_by_cap default to all stages (predict-time
   #   scaling is part of the feature definition);

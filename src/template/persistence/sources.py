@@ -1,9 +1,9 @@
 """Raw table readers: the whole file in memory, rows served by index.
 
 Raw sources are deliberately unvalidated: they return plain frames, and
-roles, validation, and encoding are applied at the composition seam
-(`data.TableSchema` + `data.ValidatedSource`). Validation here would
-couple the readers to the schema's declarations.
+raw processing, roles, and validation are applied at the composition seam
+(`features.raw` + `data.TableSchema` / `data.ValidatedSource`). Validation
+here would couple the readers to the schema's declarations.
 
 Lazy readers (e.g. `pl.scan_csv`) are a documented pattern, not shipped:
 a polars lazy scan re-executes its query on every `read`, so per-batch

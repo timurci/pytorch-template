@@ -9,10 +9,11 @@ Two principles do most of the work:
 
 1. **Layers depend on contracts, not on each other's implementations.**
    Cross-layer references are `typing.Protocol`s (`RawTableSource`,
-   `DataSource`, `ProcessingStep`, `ExperimentTracker`), `torch` abstractions
+   `DataSource`, `RawStep`, `TensorStep`, `ExperimentTracker`), `torch`
+   abstractions
    (`nn.Module`, `Optimizer`, `LRScheduler`, `DataLoader`), or one shared
    data contract (`Batch`). Swapping an implementation — a tracker, a
-   processing step, a model — touches no other layer.
+   raw or tensor step, a model — touches no other layer.
 2. **Config is the composition root.** One YAML file describes the whole
    experiment; Pydantic schemas validate it and `build()` plain library
    objects. Each schema lives in the layer of the class it builds; the CLI
@@ -22,7 +23,7 @@ Two principles do most of the work:
    scripts, or services without the CLI.
 
 The structure resembles an FTI (feature / training / inference) pipeline:
-ingestion plus feature processing and their config are the *feature pipeline*,
+ingestion plus preprocessing and their config are the *feature pipeline*,
 training is the *training pipeline*, and the inference entrypoint is the
 *inference pipeline* — all three sharing one config so what trains is what
 serves.
@@ -32,8 +33,8 @@ serves.
 | Layer | Role | Owns | Must not |
 | --- | --- | --- | --- |
 | `persistence` | Raw table readers + persistent I/O | `CsvSource` / `ParquetSource` (raw, unvalidated rows by index), `save_table`, `save_checkpoint` / `load_checkpoint`, and their `config.py` schemas | Know about validated forms, datasets, models, or training; validate structure; pick its own paths (callers supply them) |
-| `data` | Ingestion contracts + the torch-side dataset adapter | `RawTableSource` / `DataSource` ports; `TableSchema` (roles + encodings) and the encoders (`OneHot`, `MapValues`) with their `config.py` schemas; `ValidatedTable` / `ValidatedSource`; `Batch` TypedDict; `TableDataset`; `partition_indices` / `class_counts` | File I/O (rows arrive through the ports); import anything from sibling layers |
-| `features` | Feature processing | `ProcessingStep` protocol + `ProcessingPipeline` (ordered, stage-tagged steps over batches); `ScaleByCap`, `LogScaleByCap`, `GaussianNoise`, and their `config.py` schemas | File I/O; raw forms or column names in steps (config declares names, resolved at build); fitting state from data |
+| `data` | Ingestion + the torch-side dataset adapter | `RawTableSource` / `DataSource` ports; `TableSchema` (column roles); `ProcessedSource`, `ValidatedTable` / `ValidatedSource`; `Batch` TypedDict; `TableDataset`; `partition_indices` / `class_counts` | File I/O (rows arrive through the ports); import any sibling layer except `features.raw` (whose pipeline it applies) |
+| `features` | Preprocessing, raw and tensor, one file each | `features/raw.py`: `RawStep` protocol + `RawPipeline` over named raw columns (`OneHot`, `DropColumns`), the `TargetEncoder` contract, and their schemas. `features/tensor.py`: `TensorStep` protocol + `TensorPipeline` (ordered, stage-tagged steps over batches), `ScaleByCap`, `LogScaleByCap`, `GaussianNoise`, and their schemas | File I/O; fitting state from data; raw forms or column names in tensor steps (config declares names, resolved at build) |
 | `models` | Network definitions | `nn.Module` subclasses, e.g. `MLPClassifier`; `models/config.py` schemas | Anything but `torch` (its `config.py` may add `pydantic`) |
 | `tracking` | Observability port | `ExperimentTracker` protocol; `Null` / `Stdout` / `MLflow` adapters, and their `config.py` schemas | Owning external lifecycles (the CLI opens/closes the MLflow run) |
 | `training` | The training loop and checkpoint strategies | `Trainer`, `CheckpointStrategy`, the recovery and best strategies, and their `config.py` schemas | Touching sources or splitting data, building models/loaders/schedulers, choosing checkpoint paths, resuming a run, opening tracker runs |
@@ -43,6 +44,9 @@ serves.
 
 Library layers import nothing from sibling layers except the explicitly
 allowed contract imports. The CLI imports everything and composes.
+(`features` and `data` exchange one edge each — `features.tensor` takes
+`data.Batch`, `data` takes `features.raw`'s encoders — so treat the pair as
+one coupled unit rather than a strict order.)
 
 ```
                     ┌─────────────┐
@@ -60,26 +64,32 @@ persistence  data ◄─── features     models        tracking
 
 The allowed edges, exactly:
 
-- `features` → `data`: **`Batch` only** — steps consume and return the batch
-  contract; that single edge is why the batch is owned by `data` (below).
-  Step schemas resolve column names through `BlockResolver`
-  (`features/protocol.py`), structurally satisfied by `data.TableSchema`,
-  so config adds no import edge.
-- `training` → `data.Batch`, `features.ProcessingPipeline` /
-  `features.Stage`, `tracking.ExperimentTracker`,
+- `features.tensor` → `data`: **`Batch` only** — steps consume and return
+  the batch contract; that single edge is why the batch is owned by `data`
+  (below). Step schemas resolve column names through `BlockResolver`
+  (`features/tensor.py`), structurally satisfied by `data.TableSchema`,
+  so config adds no import edge. `features.raw` imports nothing from
+  siblings.
+- `data` → `features.raw`: `TableSchema` types against the `TargetEncoder`
+  contract, and `ProcessedSource` / `TableDataset` apply the `RawPipeline`
+  and `encode_target` defined there. This is the one edge that points *into*
+  the feature layer, and it is acyclic: `features.raw` imports nothing, so
+  the `data` ↔ `features` pair only looks circular at the package level.
+- `training` → `data.Batch`, `features.tensor.TensorPipeline` /
+  `features.tensor.Stage`, `tracking.ExperimentTracker`,
   `persistence.save_checkpoint` / `load_checkpoint`, plus `torch`'s own
   `nn.Module`, `Optimizer`, `LRScheduler`, and `DataLoader`. Persistence
   still stores a caller-supplied mapping; the training layer owns the
   checkpoint record.
-- `persistence` and `data` import nothing from sibling layers at all: raw
-  readers are plain classes whose methods (`columns`, `count`,
-  `read(indices) -> pl.DataFrame`) satisfy `data.RawTableSource`
-  *structurally*, so no import edge exists. `data`'s modules only import
-  each other (and `polars` / `torch`).
+- `persistence` imports nothing from sibling layers: raw readers are plain
+  classes whose methods (`columns`, `count`, `read(indices) -> pl.DataFrame`)
+  satisfy `data.RawTableSource` *structurally*, so no import edge exists.
+  `data`'s remaining modules import only each other (and `polars` /
+  `torch`).
 - `models` and `tracking` import nothing from sibling layers.
 
 Everything else (constructing the model, the optimizer, the scheduler, the
-loaders, the trackers, the processing pipeline, resuming from a checkpoint,
+loaders, the trackers, the tensor pipeline, resuming from a checkpoint,
 and choosing which file inference loads) happens in the entrypoint and is
 passed in. Checkpoint strategies, passed into the trainer, decide when to
 write.
@@ -97,9 +107,9 @@ class Batch(TypedDict):
 ```
 
 The training loop is annotated `DataLoader[Batch]`. It is owned by the
-**`data` layer**, not by training: datasets produce it, feature-processing
+**`data` layer**, not by training: datasets produce it, processing
 steps and the trainer consume it. `targets` is absent for unlabeled
-(inference) data. `source_indices` appears after feature processing: the
+(inference) data. `source_indices` appears after tensor processing: the
 pipeline guarantees it on its output (absent input provenance becomes
 `arange(N)`), and steps that change rows keep it aligned with `features` —
 that is the provenance for row-changing steps and for consumers that need
@@ -119,11 +129,12 @@ Tasks whose samples are not `(features, targets)` pairs redefine `Batch`
 here in the data layer; the processing steps, trainer, and entrypoints
 follow.
 
-## Ingestion: raw sources, column roles, encodings
+## Ingestion: raw processing, column roles, tensorization
 
-Ingestion (raw rows → encoded tensors) lives in `data` + `persistence`. It is
-two sides of one seam: the raw side serves unvalidated frames, the validated
-side serves rows checked against a declared schema.
+Ingestion (raw rows → tensor batches) is the `persistence` readers, the
+`data` contracts, and the raw pipeline in `features.raw`. It is three steps
+behind one seam: raw rows arrive through a port, a `RawPipeline` transforms
+the named columns, and a `TableSchema` declares the roles that tensorize.
 
 ```python
 class RawTableSource(Protocol):          # the raw side, satisfied structurally
@@ -139,46 +150,52 @@ class DataSource(Protocol[T_co]):        # the validated side
 
 - **Raw readers** (`persistence`: `CsvSource`, `ParquetSource`) load a
   whole table at construction and serve row slices by
-  index. They are deliberately unvalidated — roles and encoding would couple
-  them to schema declarations. Lazy readers (e.g. `pl.scan_csv`) are a
+  index. They are deliberately unvalidated — roles and raw processing would
+  couple them to declarations. Lazy readers (e.g. `pl.scan_csv`) are a
   documented pattern, not shipped: a polars lazy scan re-executes its query
   on every `read`, so per-batch reads only pay off on indexed sources such as
   a database.
-- **`TableSchema`** declares what each raw column *is* (a role) and how it
-  *becomes a tensor* (an encoding):
+- **`RawPipeline`** (`features.raw`) is an ordered list of `RawStep`s
+  applied to every read, before any tensor exists. A raw step sees the named
+  columns and the raw values, so feature selection (`DropColumns`), renaming,
+  deriving, and encoding (`OneHot`) are all raw steps; rows and their order
+  are preserved. Each step declares its output column names from its input
+  names, so the pipeline resolves its output layout — and the model's input
+  width — without reading a row. Steps are declared state, never fit from the
+  data. `ProcessedSource` wraps a raw reader with a pipeline; its `columns`
+  are the pipeline's declared output.
+- **`TableSchema`** declares what each *processed* column *is* (a role), over
+  columns `features.raw` has already made numeric:
   - **Roles are projections, not partitions.** `metadata_columns` identify
     samples and are kept untouched; `target_column` is the supervised target
     and is never a feature (that would be leakage — the schema rejects it);
     `TableSchema.from_columns` takes `exclude` columns and derives the
-    features as whatever remains, keeping raw order — declaring exclusions
+    features as whatever remains, keeping processed order — declaring
+    exclusions
     is enough, the feature set needs no list of its own. A column MAY be
     both feature and metadata (e.g. an id that is also a model input) — it
     then appears in the feature block and in the metadata side; that duality
     needs direct construction, since `from_columns` derives disjoint roles.
-  - **Encodings** map only the columns that need them: `OneHot` for
-    categoricals (levels declared inline or one per line in a `levels_path`
-    vocab file; width = number of levels), `MapValues` for the target
-    (declared class indices), numeric passthrough otherwise (width 1).
-    Encoders are declared state — never fit from the data they encode — so
-    train and inference encode identically. Uncovered values raise.
-  - **`feature_width` / `feature_slice(column)`** resolve names to
-    feature-tensor blocks in `feature_columns` order. Because a block's width
-    is its encoder's width, the feature count is known before any row is
-    read.
-- **`ValidatedSource`** wraps a raw source with a schema and is the
+  - **The target** is the one role-level encoding: `MapValues`
+    (`features.raw`) maps declared class indices, so train and inference
+    encode identically; a target without an encoder must be numeric.
+  - **Feature columns are numeric and one tensor column wide**, so
+    `feature_width` is `len(feature_columns)` — known before any row is read
+    (raw steps that change the layout declare it statically).
+    `feature_slice(column)` resolves a name to its position in
+    `feature_columns` order.
+- **`ValidatedSource`** wraps a processed source with a schema and is the
   `DataSource[ValidatedTable]` adapter: every read is checked at the
-  boundary, exactly once, so raw sources stay schema-agnostic.
-  `ValidatedTable` enforces the schema's roles — required columns present,
-  and encoderless feature/target columns must be numeric (encoded columns
-  are validated by their encoder at encode time). Extra columns are ignored,
-  so auxiliary columns ride through untouched.
+  boundary, exactly once. `ValidatedTable` enforces the schema's roles —
+  required columns present, feature columns numeric, the target numeric
+  unless a `target_encoder` maps it. Extra columns are ignored, so auxiliary
+  columns ride through untouched.
 - **`TableDataset`** is the only torch-aware piece: the adapter from
-  `DataSource[ValidatedTable]` to `Batch` samples. It encodes each column
-  through the schema's encoders and concatenates the blocks in
-  `feature_columns` order — the layout `feature_slice` documents. It
-  implements `__getitem__` (per-item fallback) and `__getitems__` (fetches a
-  whole batch's rows with a single `read`, which the `DataLoader` uses when
-  present), and nothing else.
+  `DataSource[ValidatedTable]` to `Batch` samples. It stacks the numeric
+  feature columns in `feature_columns` order into the `features` tensor and
+  maps the target through `encode_target`. It implements `__getitem__`
+  (per-item fallback) and `__getitems__` (fetches a whole batch's rows with a
+  single `read`, which the `DataLoader` uses when present), and nothing else.
 - **Random access is mandatory.** Map-style datasets need index-addressable
   rows; pure streams must adapt (materialize a buffer) at the boundary or
   are out of scope for this port.
@@ -190,22 +207,52 @@ sets (seed-random, covering all rows), stock `torch.utils.data.Subset` wraps
 the dataset (it forwards `__getitems__`, keeping batch fetch under splits),
 and `class_counts(source, indices)` reads the target through the port.
 
-## Feature processing
+## Preprocessing: raw and tensor
 
-One layer, one contract: `features` handles both preprocessing and
-augmentation, and it is **tensor-only** — a step receives a batch of tensors
-and returns a batch of tensors. Raw forms, column names, and encodings never
-appear here; names resolve to feature-tensor blocks (`feature_slice`) at
-composition time, so one step works regardless of how the data was ingested.
+The feature layer holds both kinds of preprocessing, one per file. They are
+the same idea — data changing shape before the model — split by *where they
+run*:
 
-### The step contract
+- **Raw processing** (`features/raw.py`) runs where the raw form exists: a
+  `RawPipeline` of `RawStep`s over the named `polars` columns, applied per
+  read on the CPU, before any `Batch` exists. It is the only place raw values
+  and column names are visible, and it is declared state — steps are never
+  fit from the data they process.
+- **Tensor processing** (`features/tensor.py`) runs on the target device: a
+  `TensorStep` receives a batch of tensors and returns a batch of tensors.
+  Raw forms and column names never appear here; names resolve to
+  feature-tensor blocks (`feature_slice`) at composition time, so one step
+  works regardless of how the data was ingested.
+
+**Prefer tensor processing** for any transform that can wait. It is
+vectorized over a whole batch, runs on the accelerator the model already
+uses, and draws from a seeded RNG, so it is both cheaper than per-row CPU
+work and reproducible. Reach for raw processing only when the raw form is
+required (e.g. one-hot expansion of strings, or name-based feature selection)
+or the work must happen once at read time rather than every epoch.
+
+### The raw step contract
 
 ```python
-class ProcessingStep(Protocol):
+class RawStep(Protocol):
+    def columns(self, inputs: Sequence[str]) -> tuple[str, ...]: ...  # layout
+    def process(self, frame: pl.DataFrame) -> pl.DataFrame: ...       # rows kept
+```
+
+A raw step declares its output columns from its input names, so the pipeline
+(and the schema) resolves the layout without reading rows. `DropColumns` and
+`OneHot` are the shipped steps; `OneHot` replaces a categorical column with
+`f"{column}={level}"` float columns, so every level is an ordinary numeric
+column later steps and roles can name.
+
+### The tensor step contract
+
+```python
+class TensorStep(Protocol):
     def process(self, batch: Batch, rng: Generator) -> Batch: ...
 ```
 
-Invariants (normative, see `features/protocol.py`):
+Invariants (normative, see `features/tensor.py`):
 
 - Steps never mutate their input; they return a `Batch` (cloning on write).
   Fields a step does not touch pass through unchanged.
@@ -217,7 +264,7 @@ Invariants (normative, see `features/protocol.py`):
 
 ### Composition and stages
 
-`ProcessingPipeline` applies an ordered list of `(step, stages)` pairs to one
+`TensorPipeline` applies an ordered list of `(step, stages)` pairs to one
 batch at a time. `Stage` is `"train" | "eval" | "predict"`; a step runs in
 the stages it is tagged with. Order is construction order: interleaving
 deterministic preprocessing with stochastic augmentation (`pre -> aug -> pre`)
@@ -288,7 +335,7 @@ registering a new `kind` in `tracking/config.py`'s union.
 
 `Trainer(model, optimizer, scheduler=None, device=...)` owns exactly one
 thing: the train/validation epoch loop — moving batches to the device,
-applying the processing pipeline, forward/backward/step, computing metrics,
+applying the tensor pipeline, forward/backward/step, computing metrics,
 fanning out to trackers. The pipeline runs on each batch *after* the move
 to `device`: training batches at stage `train`, validation batches at stage
 `eval` (so seeded validation-time augmentation is a tagging choice in the
@@ -337,23 +384,25 @@ ranking tasks rewrite `trainer.py` (and probably `Batch`) for their project.
 ## Configuration as composition root
 
 One YAML file describes the whole experiment: data sources and column
-roles, feature processing, model, optimizer, scheduler, loss, training loop,
-inference output. The pattern (normative detail and extension recipes:
+roles, raw and tensor processing, model, optimizer, scheduler, loss, training
+loop, inference output. The pattern (normative detail and extension recipes:
 [config-pattern.md](config-pattern.md)):
 
-- Each schema lives **with the class it builds**, in its layer's
-  `config.py` (`template.models.config`, `template.persistence.config`,
-  ...); library classes stay constructor-driven and config-free. The
+- Each schema lives **with the class it builds** — in the class's module
+  (`features/raw.py`, `features/tensor.py`) or the layer's `config.py`
+  (`template.models.config`, `template.persistence.config`, ...); library
+  classes stay constructor-driven and config-free. The
   composition root's own schema (`cli/config.py`) adds `ExperimentConfig`
   (assembly + cross-object invariants) and the run-level schemas no layer
   owns: `DataConfig` (which raw sources feed the run, column roles),
   `TrainingConfig` / `InferenceConfig`, and the optimizer/scheduler/loss
   schemas over plain `torch` objects.
 - Every schema has a `build()` method returning plain library objects.
-  Column names are config-level declarations; they resolve to
-  feature-tensor blocks when the processing pipeline is built, so
-  processing steps stay tensor-only.
-- Polymorphic slots (sources, encodings, processing steps, models,
+  Column names are config-level declarations; raw steps (`features.raw`)
+  resolve them against the raw frame, and tensor steps (`features.tensor`)
+  to feature-tensor blocks when the pipeline is built, so the steps stay
+  tensor-only.
+- Polymorphic slots (sources, raw steps, tensor steps, models,
   optimizers, schedulers, losses, trackers, checkpoints) use a `kind`
   discriminator:
   adding an implementation = new class in its layer + new `*Config` schema
@@ -376,24 +425,26 @@ hand-written `main()` wiring function with a declarative, validated file.
 presentation and application layers — for a training project that split is
 ceremony, so the CLI both parses args/config and orchestrates the use case:
 
-`template-train`: `config.data.train.build()` → `TableSchema.from_columns`
-(roles + encodings resolved from the raw columns; the resolved feature set
-and width are logged on purpose — a stray or leaky column surfaces in the
-logs and tracked params instead of inside the model) → `ValidatedSource` →
-`partition_indices` → `TableDataset` + `Subset` loaders →
-`config.model.build(schema.feature_width)` on device → optimizer, then the
-scheduler around that optimizer when configured → open trackers, log
+`template-train`: `config.data.train.build()` →
+`config.raw.build(raw.columns)` + `ProcessedSource` →
+`TableSchema.from_columns` over the pipeline's declared output columns (roles
+resolved; the resolved feature set and width are logged on purpose — a stray
+or leaky column surfaces in the logs and tracked params instead of inside the
+model) → `ValidatedSource` → `partition_indices` → `TableDataset` + `Subset`
+loaders → `config.model.build(schema.feature_width)` on device → optimizer,
+then the scheduler around that optimizer when configured → open trackers, log
 flattened config as params → optionally `restore_training_state` from the
-recovery checkpoint when `--resume` is set → `Trainer.train(processing=…,
+recovery checkpoint when `--resume` is set → `Trainer.train(tensor_pipeline=…,
 seed=…, start_epoch=…, checkpoints=…)`.
 
-`template-infer`: `config.data.test.build()` → schema built with
-`include_target=False` (target dropped when present, absent otherwise) →
-ids read through the validated source (metadata rides through untouched,
-row order preserved) → model rebuilt from the same config, weights loaded
-from the best checkpoint when that file exists and otherwise from the
-recovery checkpoint, `eval()` → per batch: processing at stage `predict`,
-then `softmax(logits, dim=1)[:, 1]` → report/save `id,<target>`.
+`template-infer`: `config.data.test.build()` → `config.raw.build(raw.columns)`
++ `ProcessedSource` → schema built with `include_target=False` (target
+dropped when present, absent otherwise) → ids read through the validated
+source (metadata rides through untouched, row order preserved) → model
+rebuilt from the same config, weights loaded from the best checkpoint when
+that file exists and otherwise from the recovery checkpoint, `eval()` → per
+batch: the tensor pipeline at stage `predict`, then
+`softmax(logits, dim=1)[:, 1]` → report/save `id,<target>`.
 
 A backend API entrypoint would do the same wiring inside request handlers
 instead of `argparse` mains; nothing in the library changes.
@@ -406,15 +457,17 @@ instead of `argparse` mains; nothing in the library changes.
 2. Adapt `data` to your samples: redefine `Batch`, the `TableDataset`
    adapter, and — if your raw form is not a polars frame — the source ports
    and the validated table they return. Extend `TableSchema` if your columns
-   need roles or encodings beyond the shipped ones.
-3. Add the processing steps your domain needs to `features` (+ their config
-   kinds); extend `ProcessingStep` invariants if your steps do something the
-   current contract forbids.
+   need roles beyond the shipped ones, and add `RawStep`s in
+   `features/raw.py` for new raw processing.
+3. Add the tensor steps your domain needs to `features/tensor.py` (+ their
+   config kinds); extend `TensorStep` invariants if your steps do something
+   the current contract forbids.
 4. Add your architecture(s) as `kind`s in `models/config.py` (or replace
    `MLPClassifier` outright).
 5. If the task isn't classification, rewrite `training/trainer.py` for your
    metrics and the model/loss schemas to match.
-6. Give every new component an `XConfig` in its layer's `config.py` and
+6. Give every new component an `XConfig` in its layer — its `config.py`, or
+   alongside the class in `features/raw.py` / `features/tensor.py` — and
    register its `kind` in the slot's union
    ([config-pattern.md](config-pattern.md) has recipes); update
    `configs/example.yaml.example` and `docs/cli.md`.

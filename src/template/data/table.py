@@ -1,12 +1,13 @@
 """The batch contract, the validated table, and the torch-side dataset adapter.
 
-Column roles and raw-value encoding are ingestion concerns: a `TableSchema`
-declares what each column is and how it becomes numbers, `ValidatedTable`
-enforces that declaration when rows are read, and `ValidatedSource` applies
-it to a raw row source. Feature processing is tensor-side and happens
-elsewhere, after ingestion. `TableDataset` is the one torch-aware adapter
-left here: it turns encoded column blocks into `Batch` samples. Splits and
-target statistics are index-based helpers so they work identically for
+Raw rows are processed by a `RawPipeline` (`features.raw`) through
+`ProcessedSource`, then a `TableSchema` declares what each processed column
+is: roles only, over numeric columns. `ValidatedTable` enforces that
+declaration when rows are read, and `ValidatedSource` applies it to a raw
+row source. `TableDataset` is the one torch-aware adapter here: it stacks
+the numeric feature columns into a `Batch` and maps the target. Tensor
+processing (`features.tensor`) happens later, on the target device. Splits
+and target statistics are index-based helpers so they work identically for
 eager and lazy sources.
 """
 
@@ -19,9 +20,9 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from template.data.encoding import encode_feature, encode_target
 from template.data.schema import TableSchema
 from template.data.source import DataSource, RawTableSource
+from template.features.raw import RawPipeline, encode_target
 
 
 class Batch(TypedDict):
@@ -49,13 +50,12 @@ class ValidatedTable:
     """A polars frame checked against a declared `TableSchema`.
 
     Construction enforces the schema's roles: every feature, target, and
-    metadata column is present, and raw values fit the declared encoding —
-    a feature column without a feature encoder, and the target without a
-    target encoder, must be numeric (encoded columns are validated by their
-    encoder at encode time). Extra columns are ignored, so sources can carry
-    auxiliary columns (e.g. an id column) through untouched. This is the
-    polars side of the source seam; the torch side (tensorization) happens
-    at ingestion, inside `TableDataset`.
+    metadata column is present, feature columns are numeric (raw processing
+    already encoded them), and the target is numeric unless a
+    `target_encoder` maps it. Extra columns are ignored, so sources can
+    carry auxiliary columns (e.g. an id column) through untouched. This is
+    the polars side of the source seam; the torch side (tensorization)
+    happens at ingestion, inside `TableDataset`.
     """
 
     def __init__(self, frame: pl.DataFrame, schema: TableSchema) -> None:
@@ -64,20 +64,15 @@ class ValidatedTable:
             required.append(schema.target_column)
         required.extend(schema.metadata_columns)
         _require_columns(frame, required)
-        bare_features = [
-            name
-            for name in schema.feature_columns
-            if name not in schema.feature_encoders
-        ]
         non_numeric = [
             name
-            for name in bare_features
+            for name in schema.feature_columns
             if not frame.schema[name].is_numeric()
         ]
         if non_numeric:
             raise TypeError(
-                f"non-numeric feature columns need an encoder: "
-                f"{sorted(non_numeric)}"
+                "non-numeric feature columns need a raw step that encodes "
+                f"them: {sorted(non_numeric)}"
             )
         if (
             schema.target_column is not None
@@ -124,16 +119,40 @@ class ValidatedSource:
         return ValidatedTable(self._raw.read(list(indices)), self._schema)
 
 
+class ProcessedSource:
+    """`RawTableSource` with a `RawPipeline` applied to every read.
+
+    Adapter from a raw source to its raw-processed form: `columns` is the
+    pipeline's declared output, so the schema (column roles and the model's
+    input width) resolves from declarations before any row is read, and
+    every read returns the processed frame that `ValidatedSource` then
+    checks.
+    """
+
+    def __init__(self, raw: RawTableSource, pipeline: RawPipeline) -> None:
+        self._raw = raw
+        self._pipeline = pipeline
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return self._pipeline.output_columns
+
+    def count(self) -> int:
+        return self._raw.count()
+
+    def read(self, indices: Sequence[int]) -> pl.DataFrame:
+        return self._pipeline.process(self._raw.read(list(indices)))
+
+
 class TableDataset(Dataset[Batch]):
     """Torch adapter over a `DataSource[ValidatedTable]`.
 
-    Owns exactly the torch-side work: encoding each column through the
-    schema's encoders and concatenating the blocks in `feature_columns`
-    order (the layout `TableSchema.feature_slice` documents) into `Batch`
-    samples. `__len__` is the source's count; the feature count comes from
-    the declared schema, so no row is ever read to discover it.
-    `__getitem__` is the per-item fallback; `__getitems__` fetches a whole
-    batch's rows with one source read, and the DataLoader uses it when
+    Owns exactly the torch-side work: stacking the numeric feature columns
+    in `feature_columns` order into a `Batch`'s `features` tensor (`F` =
+    `len(feature_columns)`). `__len__` is the source's count; the feature
+    count comes from the declared schema, so no row is ever read to discover
+    it. `__getitem__` is the per-item fallback; `__getitems__` fetches a
+    whole batch's rows with one source read, and the DataLoader uses it when
     present.
     """
 
@@ -152,10 +171,10 @@ class TableDataset(Dataset[Batch]):
     def _samples(self, table: ValidatedTable) -> list[Batch]:
         schema = table.schema
         frame = table.frame
-        features = torch.cat(
+        features = torch.stack(
             [
-                encode_feature(
-                    frame.get_column(name), schema.feature_encoders.get(name)
+                torch.tensor(
+                    frame.get_column(name).to_list(), dtype=torch.float32
                 )
                 for name in schema.feature_columns
             ],

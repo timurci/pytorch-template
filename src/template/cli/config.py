@@ -35,8 +35,8 @@ from torch.optim.lr_scheduler import (
 
 from template.config_pattern import ConfigModel, default_kind
 from template.data import TableSchema
-from template.data.config import FeatureEncodingConfig, TargetConfig
-from template.features.config import ProcessingConfig
+from template.features.raw import RawPipelineConfig, TargetConfig
+from template.features.tensor import TensorPipelineConfig
 from template.models.config import MLPModelConfig, ModelConfig
 from template.persistence.config import RawSourceConfig
 from template.tracking.config import StdoutTrackerConfig, TrackerConfig
@@ -50,8 +50,8 @@ from template.training.config import (
 class DataConfig(ConfigModel):
     """Where the rows come from and what each column is.
 
-    `train` / `test` pick raw readers by `kind`; roles and encodings build
-    the `TableSchema` over the raw columns.
+    `train` / `test` pick raw readers by `kind`; roles build the
+    `TableSchema` over the raw pipeline's output columns.
     """
 
     train: RawSourceConfig
@@ -60,12 +60,11 @@ class DataConfig(ConfigModel):
     target: TargetConfig
     metadata: list[str] = Field(default_factory=list)
     exclude: list[str] = Field(default_factory=list)
-    encodings: list[FeatureEncodingConfig] = Field(default_factory=list)
 
     def build_schema(
         self, columns: Sequence[str], *, include_target: bool = True
     ) -> TableSchema:
-        """Column names + declared roles/encodings -> `TableSchema`.
+        """Processed column names + declared roles -> `TableSchema`.
 
         Features are what remains after metadata, target, and exclusions —
         declaring exclusions is enough. `include_target=False` (inference)
@@ -86,9 +85,6 @@ class DataConfig(ConfigModel):
             target=target,
             metadata=metadata,
             exclude=exclude,
-            feature_encoders={
-                item.column: item.build() for item in self.encodings
-            },
             target_encoder=target_encoder,
         )
 
@@ -292,7 +288,8 @@ class InferenceConfig(ConfigModel):
 
 class ExperimentConfig(ConfigModel):
     data: DataConfig
-    processing: ProcessingConfig = Field(default_factory=ProcessingConfig)
+    raw: RawPipelineConfig = Field(default_factory=RawPipelineConfig)
+    tensor: TensorPipelineConfig = Field(default_factory=TensorPipelineConfig)
     model: ModelConfig
     optimizer: OptimizerConfig = Field(default_factory=AdamWConfig)
     scheduler: SchedulerConfig | None = None
