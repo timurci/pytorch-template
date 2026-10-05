@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from template.cli.config import load_config
 from template.cli.runtime import configure_logging
-from template.data import TableDataset, ValidatedSource
+from template.data import ProcessedSource, TableDataset, ValidatedSource
 from template.persistence import save_table
 from template.training import inference_checkpoint, load_model_weights
 
@@ -24,14 +24,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = load_config(args.config)
 
     raw = config.data.test.build()
-    schema = config.data.build_schema(raw.columns, include_target=False)
-    source = ValidatedSource(raw, schema)
+    pipeline = config.raw.build(raw.columns)
+    processed_source = ProcessedSource(raw, pipeline)
+    schema = config.data.build_schema(
+        processed_source.columns, include_target=False
+    )
+    source = ValidatedSource(processed_source, schema)
     # Ids are metadata: they ride through ingestion untouched (row order is
-    # preserved), so processing is free to reshape the feature blocks.
+    # preserved), so tensor processing is free to reshape the feature blocks.
     ids = source.read(range(source.count())).frame.get_column(
         config.data.id_column
     )
-    processing = config.processing.build(schema)
+    tensor_pipeline = config.tensor.build(schema)
 
     dataset = TableDataset(source)
     model = config.model.build(schema.feature_width)
@@ -51,7 +55,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     batches: list[torch.Tensor] = []
     with torch.no_grad():
         for batch in loader:
-            processed = processing.process(batch, stage="predict", rng=rng)
+            processed = tensor_pipeline.process(batch, stage="predict", rng=rng)
             logits = model(processed["features"])
             batches.append(torch.softmax(logits, dim=1)[:, 1])
     probabilities = torch.cat(batches) if batches else torch.empty(0)

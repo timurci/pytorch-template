@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 from torch.utils.data import DataLoader, Dataset
 
 from template.data import Batch
-from template.features import GaussianNoise, ProcessingPipeline
+from template.features.tensor import GaussianNoise, TensorPipeline
 from template.models import MLPClassifier
 from template.training import Trainer
 
@@ -71,14 +71,14 @@ def _trainer() -> Trainer:
 
 def test_train_epoch_with_processing_produces_finite_metrics() -> None:
     tracker = _RecordingTracker()
-    pipeline = ProcessingPipeline([(GaussianNoise(std=0.01), {"train"})])
+    pipeline = TensorPipeline([(GaussianNoise(std=0.01), {"train"})])
     _trainer().train(
         _loader(),
         _loader(),
         epochs=2,
         loss_fn=nn.CrossEntropyLoss(),
         trackers=[tracker],
-        processing=pipeline,
+        tensor_pipeline=pipeline,
         seed=42,
     )
     assert len(tracker.metrics) == 4  # train + val per epoch
@@ -100,7 +100,7 @@ def test_train_epoch_without_processing() -> None:
 def test_validation_runs_eval_tagged_steps() -> None:
     train_step = _CountingStep()
     eval_step = _CountingStep()
-    pipeline = ProcessingPipeline(
+    pipeline = TensorPipeline(
         [(train_step, {"train"}), (eval_step, {"eval"})]
     )
     _trainer().train(
@@ -108,7 +108,7 @@ def test_validation_runs_eval_tagged_steps() -> None:
         _loader(),
         epochs=1,
         loss_fn=nn.CrossEntropyLoss(),
-        processing=pipeline,
+        tensor_pipeline=pipeline,
     )
     # 64 rows / batch 16: four train batches and four validation batches.
     assert train_step.calls == 4

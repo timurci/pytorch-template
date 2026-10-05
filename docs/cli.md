@@ -10,8 +10,8 @@ uv run template-infer --config configs/example.yaml
 
 | Command | Config sections used | Result |
 | --- | --- | --- |
-| `template-train` | `data`, `processing`, `model`, `optimizer`, `scheduler`, `loss`, `training` | recovery checkpoint, and a best checkpoint when configured |
-| `template-infer` | `data`, `processing`, `model`, `inference`, `training.checkpoints` / `training.seed` | `inference.output_path` (`id,<target>`) |
+| `template-train` | `data`, `raw`, `tensor`, `model`, `optimizer`, `scheduler`, `loss`, `training` | recovery checkpoint, and a best checkpoint when configured |
+| `template-infer` | `data`, `raw`, `tensor`, `model`, `inference`, `training.checkpoints` / `training.seed` | `inference.output_path` (`id,<target>`) |
 
 Both commands validate the whole file, so a typo anywhere fails fast. Run
 `uv run template-train --help` for the flags.
@@ -23,7 +23,7 @@ Both commands validate the whole file, so a typo anywhere fails fast. Run
 - Unknown fields are rejected, so misspelled keys are errors.
 - `kind` may be omitted only where a section declares a default kind
   (`model` → `mlp`, `optimizer` → `adamw`, `loss` → `cross_entropy`);
-  sources, encodings, steps, the scheduler, trackers, and checkpoint
+  sources, raw steps, tensor steps, the scheduler, trackers, and checkpoint
   entries require it.
   `scheduler` may also be omitted entirely, which keeps a constant learning
   rate.
@@ -38,7 +38,7 @@ cp configs/example.yaml.example configs/example.yaml
 ```
 
 Sections are typed; slots that pick an implementation are `kind`-tagged
-unions (sources, encodings, steps, model, optimizer, scheduler, loss,
+unions (sources, raw steps, tensor steps, model, optimizer, scheduler, loss,
 trackers). A section with a default kind may omit the tag; see the bullets
 above. The
 schema pattern and how to add a `kind`:
@@ -48,10 +48,10 @@ schema pattern and how to add a `kind`:
 
 ### `data`
 
-Column *roles* (what a column is) and *encodings* (how it becomes a tensor)
-are declared here. Features are whatever remains after metadata, target, and
-exclusions — declaring exclusions is enough. The resolved feature set and
-width are logged at startup.
+Column *roles* (what a column is) are declared here. Features are whatever
+remains after metadata, target, and exclusions — declaring exclusions is
+enough. Features must be numeric once raw processing has run; the resolved
+feature set and width are logged at startup.
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -62,7 +62,6 @@ width are logged at startup.
 | `target.mapping` | map[str, int] | required | class indices; non-empty, injective, must cover exactly `0..n_classes-1` |
 | `metadata` | [str] | `[]` | columns kept untouched as sample identity; must not overlap `target` / `exclude` |
 | `exclude` | [str] | `[]` | dropped columns; must not overlap `metadata` / `target` |
-| `encodings` | list | `[]` | feature encodings; see below |
 
 `train` / `test` are raw readers (`data.RawTableSource` implementations),
 selected by `kind`:
@@ -77,24 +76,35 @@ A metadata column is never a feature; the target is never a feature
 (the derived roles are disjoint); the library `TableSchema` allows that
 duality via direct construction.
 
-#### `data.encodings`
+### `raw` (raw processing)
+
+One ordered list of steps (`features/raw.py`) applied to every read, over the
+named raw columns, on the CPU — before any tensor exists. Raw steps are the
+only place raw values and column names are visible, so name-based feature
+selection, renaming, deriving, and encoding all live here. The pipeline
+declares its output columns, so the column roles (and the model's input
+width) resolve without reading a row.
+
+Prefer `tensor` below for any transform that can wait: raw processing costs
+one pass on the CPU per read, while a tensor step is vectorized and runs on
+the accelerator.
 
 | `kind` | Fields | Behavior |
 | --- | --- | --- |
-| `one_hot` | `column`, `levels: [str]` or `levels_path` (exactly one) | One-hot block of width `len(levels)`; values outside the levels raise |
+| `one_hot` | `column`, `levels: [str]` or `levels_path` (exactly one) | replaces `column` with one `f"{column}={level}"` float column per level; values outside the levels raise |
+| `drop_columns` | `columns: [str]` | drops the named columns (name-based feature selection) |
 
-Feature columns without an encoding pass through numerically (width 1) and
-must be numeric in the data (error otherwise). The target always uses
-`target.mapping`. `levels_path` points at a vocab file with one level per
-line, for vocabularies too large for the config.
+`levels_path` points at a vocab file with one level per line, for
+vocabularies too large for the config.
 
-### `processing`
+### `tensor` (tensor processing)
 
-One ordered list of tensor-only steps applied to every batch after the move
-to the training device; preprocessing and augmentation interleave freely —
-stacking is list order (`pre -> aug -> pre` needs no phases). Column names
-resolve to feature blocks at composition, so a step on a non-feature column
-fails at build. `stages` picks where a step runs:
+One ordered list of tensor-only steps (`features/tensor.py`) applied to
+every batch after the move to the training device; preprocessing and
+augmentation interleave freely — stacking is list order (`pre -> aug -> pre`
+needs no phases). Column names resolve to feature blocks at composition, so a
+step on a non-feature column fails at build. `stages` picks where a step
+runs:
 
 | Stage | Runs on |
 | --- | --- |
@@ -112,13 +122,14 @@ fails at build. `stages` picks where a step runs:
 (predict-time scaling is part of the feature definition) and to `[train]`
 for `gaussian_noise`; it must name at least one stage. Steps never mutate
 their input, and row-changing steps keep `source_indices` / `targets`
-aligned; see [architecture.md](architecture.md#feature-processing) for the
+aligned; see
+[architecture.md](architecture.md#preprocessing-raw-and-tensor) for the
 contract.
 
 Seeded validation-time augmentation is a stage tag, not a code change:
 
 ```yaml
-processing:
+tensor:
   steps:
     - {kind: gaussian_noise, std: 0.005, stages: [eval]}
 ```
@@ -186,7 +197,7 @@ not kinds: the trainer calls `step()` with no arguments, once per epoch.
 | `epochs` | 10 | |
 | `batch_size` | 4096 | train and validation loaders |
 | `val_fraction` | 0.1 | seed-random train/val index partition; `null` disables validation |
-| `seed` | 42 | partition, DataLoader shuffle, processing RNG streams (and the inference `predict` stream) |
+| `seed` | 42 | partition, DataLoader shuffle, tensor RNG streams (and the inference `predict` stream) |
 | `shuffle` | true | training loader only |
 | `device` | `auto` | `auto` picks CUDA, then MPS, then CPU; or force `cpu` / `cuda` / `mps` |
 | `trackers` | `[{kind: stdout}]` | see below |
@@ -254,7 +265,7 @@ features: ('age', 'income', 'city') (width 5)
 train target distribution: 0=900 (75.00%), 1=300 (25.00%)
 val target distribution: 0=99 (73.88%), 1=35 (26.12%)
 device=cpu rows=1200+134 epochs=10
-params {'data.train.kind': 'csv', ..., 'processing.steps': '[...]', ...}
+params {'data.train.kind': 'csv', ..., 'tensor.steps': '[...]', ...}
 step=0 metrics {'train/loss': 0.2421, 'train/accuracy': 0.8897, ...}
 step=0 metrics {'val/loss': 0.2379, 'val/accuracy': 0.8925, ...}
 saved checkpoint to outputs/best.pt
@@ -267,7 +278,7 @@ epoch, as `saved checkpoint to outputs/recovery.pt`.
 `features: ...` is the resolved feature set and width — logged on purpose, so
 a stray or leaky column surfaces here (and in the tracked params) instead of
 inside the model. `params` is the flattened config with dotted keys; lists
-such as `processing.steps` are JSON-encoded. With
+such as `tensor.steps` are JSON-encoded. With
 `loss.class_weights: balanced`, the resolved weights are logged and tracked
 as `loss.class_weights_effective`. Classes with no predictions or no support
 during an epoch log `0.0`, so trackers never see NaN. An inference run
@@ -284,12 +295,14 @@ saved predictions to outputs/predictions.csv
 `template-train`:
 
 1. `data.train.build()` (the `kind`-picked raw reader);
-   `TableSchema.from_columns` resolves roles
-   and encodings from the raw columns (`metadata` + `id_column` as metadata,
-   `exclude` and the target out, everything else features) and logs the
-   resolved feature set and width. Bad declarations (unknown columns,
-   overlapping roles, encodings for non-feature columns) fail here.
-2. `ValidatedSource(raw, schema)` validates every read at the boundary.
+   `config.raw.build(raw.columns)` builds the raw pipeline and
+   `ProcessedSource` applies it per read. `TableSchema.from_columns` then
+   resolves roles over the pipeline's declared output columns (`metadata` +
+   `id_column` as metadata, `exclude` and the target out, everything else
+   features) and logs the resolved feature set and width. Bad declarations
+   (unknown columns, overlapping roles) fail here; a non-numeric feature
+   column is rejected when rows are read.
+2. `ValidatedSource(processed, schema)` validates every read at the boundary.
 3. `partition_indices(count, val_fraction, seed)`; skipped when
    `val_fraction` is `null` (all rows train). Each partition's per-class
    target distribution is logged.
@@ -297,7 +310,7 @@ saved predictions to outputs/predictions.csv
    `DataLoader`s; `input_size` is `schema.feature_width`.
 5. Build the model (`model.build(schema.feature_width)`) on `device`, the
    optimizer, the scheduler around that optimizer when `scheduler` is set,
-   and the loss. The processing pipeline is built from `processing.steps`
+   and the loss. The tensor pipeline is built from `tensor.steps`
    against the schema.
    `loss.class_weights: balanced` resolves inverse-frequency weights from
    the train partition's class counts. With `--resume`, load the recovery
@@ -306,7 +319,7 @@ saved predictions to outputs/predictions.csv
    score when that file exists.
 6. Open the trackers, log the flattened config as params, and run `Trainer`
    for `range(start_epoch, epochs)` with the checkpoint strategies,
-   `processing=...`, and `seed=...` (batches are processed per stage:
+   `tensor_pipeline=...`, and `seed=...` (batches are processed per stage:
    `train` for training, `eval` for validation). Strategies write during
    the loop.
 
@@ -319,9 +332,9 @@ saved predictions to outputs/predictions.csv
    ride through ingestion untouched and row order is preserved.
 2. Rebuild the model from the same config, load weights from the best
    checkpoint when that file exists and otherwise from the recovery
-   checkpoint, `eval()` on CPU; build the processing pipeline from the same
-   `processing.steps`.
-3. Per batch: `processing.process(batch, stage="predict", rng=...)` (the
+   checkpoint, `eval()` on CPU; build the tensor pipeline from the same
+   `tensor.steps`.
+3. Per batch: `tensor_pipeline.process(batch, stage="predict", rng=...)` (the
    generator is seeded from `training.seed`), then
    `softmax(logits, dim=1)[:, 1]`.
 4. Optionally report and/or save `id,<target>`.

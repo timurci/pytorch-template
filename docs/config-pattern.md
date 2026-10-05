@@ -48,9 +48,11 @@ The rules, normatively:
 
 ## Where schemas live
 
-A schema lives **with the class it builds**, in that layer's `config.py`
-(`template.models.config`, `template.persistence.config`, ...). Shared
-pieces — the strict `ConfigModel` base and `default_kind` — live in
+A schema lives **with the class it builds**: in the class's own module when
+the layer groups classes by concept (`features/raw.py`, `features/tensor.py`)
+or in the layer's `config.py` (`template.models.config`,
+`template.persistence.config`, ...) otherwise. Shared pieces — the strict
+`ConfigModel` base and `default_kind` — live in
 `template/config_pattern.py`. Two things stay in `cli/config.py`, the
 composition root's own schema:
 
@@ -68,9 +70,9 @@ the library layers knows about YAML.
 | YAML slot | Union (`kind`-tagged) | Schema module | Builds |
 | --- | --- | --- | --- |
 | `data.train` / `data.test` | `RawSourceConfig` | `persistence/config.py` | `CsvSource` / `ParquetSource` |
-| `data.target` | — (single shape) | `data/config.py` | `MapValues` |
-| `data.encodings` | `FeatureEncodingConfig` | `data/config.py` | `OneHot` |
-| `processing.steps` | `ProcessingStepConfig` | `features/config.py` | `(ProcessingStep, stages)` |
+| `data.target` | — (single shape) | `features/raw.py` | `MapValues` |
+| `raw.steps` | `RawStepConfig` | `features/raw.py` | `RawStep` |
+| `tensor.steps` | `TensorStepConfig` | `features/tensor.py` | `(TensorStep, stages)` |
 | `model` | `ModelConfig` | `models/config.py` | `nn.Module` |
 | `optimizer` | `OptimizerConfig` | `cli/config.py` | `torch.optim.Optimizer` |
 | `scheduler` | `SchedulerConfig` | `cli/config.py` | `torch.optim.lr_scheduler.LRScheduler` |
@@ -93,14 +95,14 @@ RawSourceConfig = Annotated[
   exact: an unknown `kind` fails at load time, before
   any data is touched.
 - A union with one member is the normal state of a young slot
-  (`FeatureEncodingConfig`, `ModelConfig`): the slot is a union from day
+  (`ModelConfig`): the slot is a union from day
   one, so adding a variant is one line and no call site changes.
 - Declaring a field default alone does not make the tag optional: tag
   dispatch needs the tag before it can pick the member. A slot that wants
   omission says so once, with `default_kind("<kind>")` after the
   discriminator (`model` → `mlp`, `optimizer` → `adamw`, `loss` →
   `cross_entropy`); every other slot (`data.train` / `test`,
-  `data.encodings[]`, `processing.steps[]`, `scheduler`,
+  `raw.steps[]`, `tensor.steps[]`, `scheduler`,
   `training.trackers[]`, `training.checkpoints[]`) requires the tag in YAML.
   `scheduler` may also be
   omitted entirely, which builds no scheduler.
@@ -207,7 +209,7 @@ Same recipe, one layer down. Say ingestion should also accept JSON files:
 1. `persistence/sources.py`: `JsonSource` — loads the table at
    construction, serves rows by index (random access is mandatory for the
    map-style dataset port; see
-   [architecture.md](architecture.md#ingestion-raw-sources-column-roles-encodings)).
+   [architecture.md](architecture.md#ingestion-raw-processing-column-roles-tensorization)).
 2. `persistence/config.py`:
 
    ```python
@@ -225,20 +227,27 @@ Same recipe, one layer down. Say ingestion should also accept JSON files:
 4. YAML: `data: {train: {kind: json, path: data/train.json}, ...}`.
 
 Again the CLI is untouched: it already calls `config.data.train.build()`.
-Remember that readers stay **unvalidated** — roles and encodings are
+Remember that readers stay **unvalidated** — roles and raw steps are
 declarations applied at the composition seam, so a new reader needs to
 know nothing about schemas.
 
-## Recipe: a processing step or a tracker
+## Recipe: a raw step, a tensor step, or a tracker
 
-- **Step**: `XConfig` in `features/config.py` with
-  `build(resolve) -> tuple[ProcessingStep, frozenset[Stage]]`, registered
-  in `ProcessingStepConfig` (the tag is required — steps declare no
-  default kind). Column names are declarations resolved at
-  build through `resolve.feature_slice(column)` (`BlockResolver`,
-  structurally satisfied by `TableSchema`), so steps stay tensor-only.
-  Tag `stages` defaults honestly: deterministic steps run at every stage,
-  stochastic ones at `train` only.
+- **Raw step**: a class in `features/raw.py` with
+  `columns(inputs) -> tuple[str, ...]` (its static output layout) and
+  `process(frame) -> frame` (rows preserved), plus an `XConfig` registered
+  in `RawStepConfig`. Column names are visible here; selection, renaming,
+  deriving, and encoding all fit. Declare the output columns honestly — the
+  schema's roles and the model's input width are resolved from them.
+- **Tensor step**: a class in `features/tensor.py` with
+  `process(batch, rng) -> batch`, plus an `XConfig` with
+  `build(resolve) -> tuple[TensorStep, frozenset[Stage]]` registered in
+  `TensorStepConfig` (the tag is required — steps declare no default kind).
+  Column names are declarations resolved at build through
+  `resolve.feature_slice(column)` (`BlockResolver`, structurally satisfied
+  by `TableSchema`), so steps stay tensor-only. Tag `stages` defaults
+  honestly: deterministic steps run at every stage, stochastic ones at
+  `train` only.
 - **Tracker**: `XConfig` in `tracking/config.py`, registered in
   `TrackerConfig` (the tag is required). Trackers stay passive; any
   external lifecycle (an MLflow run, a W&B session) is opened by the
@@ -247,8 +256,8 @@ know nothing about schemas.
 ## Adding a kind, in checklist form
 
 1. The plain class in its layer (constructor-driven, no config types).
-2. `XConfig` in that layer's `config.py`: a `ConfigModel` subclass, `kind`
-   `Literal`, field constraints, `build()`.
+2. `XConfig` alongside the class (its module or the layer's `config.py`): a
+   `ConfigModel` subclass, `kind` `Literal`, field constraints, `build()`.
 3. One line in the slot's union; add `default_kind(...)` only if the slot
    should also accept a tag-less mapping.
 4. `configs/example.yaml.example` and [cli.md](cli.md) learn the new kind.

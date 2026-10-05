@@ -1,33 +1,36 @@
-"""The declared roles and encodings of the columns a data source serves."""
+"""The declared roles of the columns a data source serves.
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+Roles over the *processed* columns: raw processing (`features.raw`) has
+already run, so feature columns are numeric and each is one tensor column
+wide. The target's declared class mapping (`features.raw.MapValues`) is the
+one role-level encoding, applied at tensorization.
+"""
 
-from template.data.encoding import FeatureEncoder, TargetEncoder
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from template.features.raw import TargetEncoder
 
 
 @dataclass(frozen=True)
 class TableSchema:
-    """What each raw column of a table is, and how it becomes a tensor.
+    """What each processed column of a table is, and its tensor layout.
 
     Roles are projections, not partitions: a column may be both a feature
     and metadata (e.g. an id that is also a model input) — it then appears
     in the feature block and in the metadata side. `metadata_columns`
     identify samples and are kept untouched, `target_column` is the
     supervised target (never a feature; that would be leakage), excluded
-    columns are gone, and everything else is a feature.
-    Feature tensor blocks follow `feature_columns` order; a feature
-    column's block width is its encoder's `width` (1 for numeric
-    passthrough), so the feature count is known before any row is read.
+    columns are gone, and everything else is a feature. Feature tensor
+    blocks follow `feature_columns` order; raw processing has already made
+    every feature numeric, so the feature count is `len(feature_columns)` —
+    known before any row is read.
 
-    `feature_encoders` / `target_encoder` map only the columns that need
-    them (non-numeric values); a column without an encoder must be numeric.
+    `target_encoder` maps only a non-numeric target (declared class
+    indices); a target without an encoder must be numeric.
     """
 
     feature_columns: tuple[str, ...]
-    feature_encoders: Mapping[str, FeatureEncoder] = field(
-        default_factory=dict
-    )
     target_column: str | None = None
     target_encoder: TargetEncoder | None = None
     metadata_columns: tuple[str, ...] = ()
@@ -47,12 +50,6 @@ class TableSchema:
         )
         if not self.feature_columns:
             raise ValueError("schema must declare at least one feature column")
-        unknown = set(self.feature_encoders) - set(self.feature_columns)
-        if unknown:
-            raise ValueError(
-                f"encoders declared for non-feature columns: "
-                f"{sorted(unknown)}"
-            )
         if self.target_column in self.feature_columns:
             raise ValueError(
                 f"target column {self.target_column!r} is a feature"
@@ -74,10 +71,9 @@ class TableSchema:
         target: str | None = None,
         metadata: Sequence[str] = (),
         exclude: Sequence[str] = (),
-        feature_encoders: Mapping[str, FeatureEncoder] | None = None,
         target_encoder: TargetEncoder | None = None,
     ) -> TableSchema:
-        """Derive the schema from raw column names by role.
+        """Derive the schema from processed column names by role.
 
         Features are what remains of `columns` after the metadata, target,
         and excluded columns, keeping raw order; declaring exclusions is
@@ -103,7 +99,6 @@ class TableSchema:
         features = tuple(name for name in columns if name not in keep)
         return cls(
             feature_columns=features,
-            feature_encoders=dict(feature_encoders or {}),
             target_column=target,
             target_encoder=target_encoder,
             metadata_columns=tuple(metadata),
@@ -112,21 +107,11 @@ class TableSchema:
     @property
     def feature_width(self) -> int:
         """Total tensor width of one row's features."""
-        return sum(self.width(name) for name in self.feature_columns)
-
-    def width(self, column: str) -> int:
-        """Tensor width of one feature column's block."""
-        encoder = self.feature_encoders.get(column)
-        return encoder.width if encoder is not None else 1
+        return len(self.feature_columns)
 
     def feature_slice(self, column: str) -> slice:
         """Block of the feature tensor belonging to one feature column."""
         if column not in self.feature_columns:
             raise ValueError(f"not a feature column: {column!r}")
-        start = sum(
-            self.width(name)
-            for name in self.feature_columns[
-                : self.feature_columns.index(column)
-            ]
-        )
-        return slice(start, start + self.width(column))
+        index = self.feature_columns.index(column)
+        return slice(index, index + 1)
